@@ -15,19 +15,29 @@ import json
 import os
 import time
 import webbrowser
+import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
-from threading import Thread
+from threading import Thread, Lock, Event
 from pathlib import Path
+import hashlib
 
+# Optional imports with graceful fallback
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+# FastAPI and uvicorn are required
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse
 import uvicorn
 
 # ============================================================================
-# Attempt to import existing project components
+# Attempt to import existing project components (graceful fallback)
 # ============================================================================
 
 try:
@@ -40,6 +50,20 @@ try:
 except ImportError:
     analyze_project = None
     ProjectIntelligence = None
+
+# ============================================================================
+# Logging Setup
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("dashboard.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("dashboard")
 
 # ============================================================================
 # Data Models
@@ -73,25 +97,23 @@ class Project:
     framework: str
     language: str
     database: str
-    runtime_version: str = "v1.0.0"
+    package_manager: str = "Not Detected"
+    deployment: str = "Not Detected"
+    authentication: str = "Not Detected"
+    os: str = "Not Detected"
+    architecture: str = "Not Detected"
+    runtime_version: str = "Not Detected"
     started_at: datetime = field(default_factory=datetime.now)
-    status: RuntimeStatus = RuntimeStatus.RUNNING
-    security_score: int = 85
+    status: RuntimeStatus = RuntimeStatus.STOPPED
+    security_score: int = 0
 
     def uptime(self) -> str:
+        if self.status != RuntimeStatus.RUNNING:
+            return "Not Running"
         delta = datetime.now() - self.started_at
         hours, remainder = divmod(delta.total_seconds(), 3600)
         minutes, _ = divmod(remainder, 60)
         return f"{int(hours)}h {int(minutes)}m"
-
-
-@dataclass
-class RequestMetrics:
-    total: int = 0
-    blocked: int = 0
-    allowed: int = 0
-    rate_per_second: float = 0.0
-    avg_latency_ms: float = 0.0
 
 
 @dataclass
@@ -105,6 +127,7 @@ class Threat:
     reason: str
     decision: str  # "block" or "allow"
     source_ip: str
+    latency_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -117,18 +140,8 @@ class Threat:
             "reason": self.reason,
             "decision": self.decision,
             "source_ip": self.source_ip,
+            "latency_ms": self.latency_ms,
         }
-
-
-@dataclass
-class PerformanceMetrics:
-    cpu_percent: float = 0.0
-    memory_mb: float = 0.0
-    avg_scan_time_ms: float = 0.0
-    avg_runtime_cost_ms: float = 0.0
-    requests_processed: int = 0
-    requests_blocked: int = 0
-    requests_allowed: int = 0
 
 
 @dataclass
@@ -138,6 +151,7 @@ class Warning:
     description: str
     severity: ThreatSeverity
     timestamp: datetime
+    category: str = "general"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -146,100 +160,334 @@ class Warning:
             "description": self.description,
             "severity": self.severity.value,
             "timestamp": self.timestamp.isoformat(),
+            "category": self.category,
         }
 
 
 @dataclass
 class RuntimeConfig:
-    status: RuntimeStatus = RuntimeStatus.RUNNING
-    version: str = "v1.0.0"
+    status: RuntimeStatus = RuntimeStatus.STOPPED
+    version: str = "Not Detected"
     started_at: datetime = field(default_factory=datetime.now)
 
 
 # ============================================================================
-# Real Data Provider
+# Runtime Metrics Writer and Event Logger
+# ============================================================================
+
+class RuntimeMetricsWriter:
+    """Continuously updates runtime_metrics.json every second with real system data."""
+
+    def __init__(self, metrics_path: Path = Path("runtime_metrics.json")):
+        self.metrics_path = metrics_path
+        self._stop_event = Event()
+        self._thread: Optional[Thread] = None
+        self._lock = Lock()
+        self._metrics = {
+            "total_requests": 0,
+            "allowed_requests": 0,
+            "blocked_requests": 0,
+            "requests_per_second": 0,
+            "average_latency_ms": 0,
+            "avg_scan_time_ms": 0,
+            "avg_runtime_cost_ms": 0,
+            "cpu_usage": 0,
+            "memory_usage": 0,
+            "runtime_health": "healthy",
+            "runtime_status": "stopped",
+            "uptime": 0,
+            "version": "1.0.0",
+            "started_at": datetime.now().isoformat(),
+        }
+        self._last_request_count = 0
+        self._last_block_count = 0
+        self._last_allow_count = 0
+        self._last_time = time.time()
+        self._running = False
+        self._start_time = time.time()
+
+        # Ensure initial file exists
+        self._write_metrics()
+
+    def start(self):
+        """Start the background writer thread."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._running = True
+        self._start_time = time.time()
+        self._thread = Thread(target=self._run, daemon=True, name="MetricsWriter")
+        self._thread.start()
+        logger.info("RuntimeMetricsWriter started")
+
+    def stop(self):
+        """Stop the background writer thread."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._running = False
+        logger.info("RuntimeMetricsWriter stopped")
+
+    def _run(self):
+        """Main loop: update metrics every second."""
+        while not self._stop_event.is_set():
+            try:
+                self._update_metrics()
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in metrics writer: {e}")
+
+    def _update_metrics(self):
+        """Gather system stats and update the metrics file."""
+        with self._lock:
+            # CPU & Memory using psutil if available
+            cpu = 0.0
+            mem = 0.0
+            if psutil:
+                try:
+                    cpu = psutil.cpu_percent(interval=0.1)
+                    mem = psutil.virtual_memory().used / (1024 * 1024)  # MB
+                except Exception:
+                    pass
+
+            self._metrics["cpu_usage"] = round(cpu, 1)
+            self._metrics["memory_usage"] = round(mem, 1)
+
+            # Update uptime
+            if self._running:
+                self._metrics["uptime"] = int(time.time() - self._start_time)
+
+            # Calculate rates (we need to track counts over time)
+            # We'll maintain internal counters that can be incremented externally
+            # For now, we use the stored total_requests and blocked_requests
+            now = time.time()
+            elapsed = now - self._last_time
+            if elapsed > 0:
+                total = self._metrics["total_requests"]
+                blocked = self._metrics["blocked_requests"]
+                allowed = self._metrics["allowed_requests"]
+                # Compute instantaneous rate
+                self._metrics["requests_per_second"] = round((total - self._last_request_count) / elapsed, 1)
+                self._last_request_count = total
+                self._last_block_count = blocked
+                self._last_allow_count = allowed
+                self._last_time = now
+
+            # Determine health based on error rates or CPU load
+            health = "healthy"
+            if self._metrics["cpu_usage"] > 80:
+                health = "degraded"
+            if self._metrics["memory_usage"] > 80:
+                health = "degraded"
+            # If blocked ratio high, degrade
+            total_req = self._metrics["total_requests"]
+            blocked_req = self._metrics["blocked_requests"]
+            if total_req > 0 and (blocked_req / total_req) > 0.3:
+                health = "degraded"
+            if self._metrics.get("runtime_status") == "error":
+                health = "unhealthy"
+            self._metrics["runtime_health"] = health
+
+            # Write to file
+            self._write_metrics()
+
+    def _write_metrics(self):
+        """Write current metrics to the JSON file."""
+        try:
+            with open(self.metrics_path, "w") as f:
+                json.dump(self._metrics, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to write runtime metrics: {e}")
+
+    # Public methods to update counters
+    def increment_requests(self, count: int = 1):
+        with self._lock:
+            self._metrics["total_requests"] += count
+
+    def increment_blocked(self, count: int = 1):
+        with self._lock:
+            self._metrics["blocked_requests"] += count
+            self._metrics["total_requests"] += count  # blocked also counts as request
+
+    def increment_allowed(self, count: int = 1):
+        with self._lock:
+            self._metrics["allowed_requests"] += count
+            self._metrics["total_requests"] += count
+
+    def set_latency(self, latency_ms: float):
+        with self._lock:
+            # Simple exponential moving average
+            old = self._metrics["average_latency_ms"]
+            if old == 0:
+                self._metrics["average_latency_ms"] = latency_ms
+            else:
+                self._metrics["average_latency_ms"] = old * 0.9 + latency_ms * 0.1
+
+    def set_status(self, status: str):
+        with self._lock:
+            self._metrics["runtime_status"] = status
+            if status == "running":
+                self._running = True
+                self._start_time = time.time()
+                self._metrics["started_at"] = datetime.now().isoformat()
+                self._metrics["uptime"] = 0
+            elif status == "stopped":
+                self._running = False
+                self._metrics["uptime"] = 0
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._metrics.copy()
+
+
+class RuntimeEventLogger:
+    """Appends runtime events to runtime_events.jsonl."""
+
+    def __init__(self, events_path: Path = Path("runtime_events.jsonl")):
+        self.events_path = events_path
+        self._lock = Lock()
+        # Ensure file exists
+        self.events_path.touch(exist_ok=True)
+
+    def log_event(self, event: Dict[str, Any]) -> None:
+        """Append a single event as JSON line."""
+        with self._lock:
+            try:
+                with open(self.events_path, "a") as f:
+                    f.write(json.dumps(event) + "\n")
+            except Exception as e:
+                logger.error(f"Failed to log event: {e}")
+
+    def log_threat(self, method: str, path: str, severity: str, reason: str,
+                   decision: str = "block", source_ip: str = "0.0.0.0",
+                   latency_ms: float = 0.0, status: str = "blocked") -> None:
+        """Convenience method to log a threat event."""
+        event = {
+            "id": f"evt-{int(time.time()*1000)}",
+            "timestamp": datetime.now().isoformat(),
+            "method": method,
+            "path": path,
+            "severity": severity,
+            "status": status,
+            "reason": reason,
+            "decision": decision,
+            "source_ip": source_ip,
+            "latency_ms": latency_ms,
+        }
+        self.log_event(event)
+
+
+# ============================================================================
+# Real Data Provider with File Watching
 # ============================================================================
 
 class RuntimeDataProvider:
     """Provides real project data from technology detector and intelligence engine,
-       and reads runtime metrics/events from files.
+       and reads runtime metrics/events from files with automatic reloading.
     """
 
     def __init__(self, project_path: str = "."):
-        self.project_path = project_path
+        self.project_path = Path(project_path).resolve()
         self._projects: List[Project] = []
         self._warnings: List[Warning] = []
-        self._intelligence: Optional[ProjectIntelligence] = None
+        self._intelligence: Optional[Any] = None
+        self._fingerprint: Optional[Dict[str, Any]] = None
         self._runtime_metrics_path = Path("runtime_metrics.json")
         self._runtime_events_path = Path("runtime_events.jsonl")
-        self._runtime_config = RuntimeConfig(status=RuntimeStatus.STOPPED)
+        self._runtime_config = RuntimeConfig()
+        self._lock = Lock()
+        self._last_metrics_mtime: float = 0.0
+        self._last_events_mtime: float = 0.0
+        self._last_fingerprint_mtime: float = 0.0
+        self._last_intelligence_mtime: float = 0.0
+        self._file_watch_thread: Optional[Thread] = None
+        self._stop_watch = False
+
+        # Metrics writer and event logger
+        self.metrics_writer = RuntimeMetricsWriter(self._runtime_metrics_path)
+        self.event_logger = RuntimeEventLogger(self._runtime_events_path)
+
+        # Load initial data
+        self._load_all()
+        # Start file watcher for metrics/events
+        self._start_file_watcher()
+        # Start metrics writer
+        self.metrics_writer.start()
+
+    def _start_file_watcher(self) -> None:
+        """Start background thread to watch for file changes."""
+        self._stop_watch = False
+        self._file_watch_thread = Thread(target=self._watch_files, daemon=True)
+        self._file_watch_thread.start()
+
+    def _watch_files(self) -> None:
+        """Poll files for changes every second."""
+        while not self._stop_watch:
+            time.sleep(1)
+            try:
+                self._reload_if_changed()
+            except Exception as e:
+                logger.error(f"File watch error: {e}")
+
+    def _reload_if_changed(self) -> None:
+        """Check modification times and reload if changed."""
+        # Check runtime_metrics.json
+        metrics_mtime = self._runtime_metrics_path.stat().st_mtime if self._runtime_metrics_path.exists() else 0
+        if metrics_mtime > self._last_metrics_mtime:
+            self._last_metrics_mtime = metrics_mtime
+            self._read_runtime_metrics(force=True)
+
+        # Check runtime_events.jsonl
+        events_mtime = self._runtime_events_path.stat().st_mtime if self._runtime_events_path.exists() else 0
+        if events_mtime > self._last_events_mtime:
+            self._last_events_mtime = events_mtime
+            # events are read on demand via get_threats
+
+    def _load_all(self) -> None:
+        """Load fingerprint and intelligence."""
         self._load_project_intelligence()
+        self._read_runtime_metrics(force=True)
+        self._build_projects_from_intelligence()
+        self._build_warnings_from_intelligence()
 
     def _load_project_intelligence(self) -> None:
         """Load technology fingerprint and project intelligence."""
         if tech_scanner is None or analyze_project is None:
-            # Fallback: create a dummy project from environment
-            self._projects = [
-                Project(
-                    name="Unknown Project",
-                    framework="unknown",
-                    language="unknown",
-                    database="unknown",
-                    runtime_version="v0.0.0",
-                    status=RuntimeStatus.STOPPED,
-                    security_score=0,
-                )
-            ]
+            logger.warning("Tech Scanner or Project Intelligence not available")
+            self._intelligence = None
+            self._fingerprint = None
             return
 
         try:
-            fingerprint = tech_scanner.scan_project(self.project_path)
-            self._intelligence = analyze_project(fingerprint)
-            self._build_projects_from_intelligence()
-            self._build_warnings_from_intelligence()
-            # Set runtime version from intelligence if available
-            if self._intelligence and self._intelligence.primary_application:
-                app = self._intelligence.primary_application
-                # Infer version from framework version if present
-                version = "v1.0.0"
-                # Could look at dependencies
-                self._runtime_config.version = version
+            logger.info("Loading technology fingerprint...")
+            self._fingerprint = tech_scanner.scan_project(str(self.project_path))
+            logger.info("Analyzing project intelligence...")
+            self._intelligence = analyze_project(self._fingerprint)
+            self._last_fingerprint_mtime = time.time()
+            self._last_intelligence_mtime = time.time()
         except Exception as e:
-            print(f"Failed to load project intelligence: {e}")
+            logger.error(f"Failed to load project intelligence: {e}")
+            self._intelligence = None
+            self._fingerprint = None
 
     def _build_projects_from_intelligence(self) -> None:
         """Convert ProjectIntelligence applications to Project list."""
         if not self._intelligence:
+            self._projects = []
             return
-        apps = self._intelligence.applications
+
+        apps = getattr(self._intelligence, 'applications', [])
         if not apps:
-            # Create a default project from fingerprint
-            detected = self._intelligence.__dict__.get("detected", {})
-            framework = detected.get("language", "unknown")
-            lang = detected.get("language", "unknown")
-            db = detected.get("databases", ["unknown"])[0] if detected.get("databases") else "unknown"
-            self._projects = [
-                Project(
-                    name="Project",
-                    framework=framework,
-                    language=lang,
-                    database=db,
-                    runtime_version="v1.0.0",
-                    status=RuntimeStatus.RUNNING if self._runtime_config.status == RuntimeStatus.RUNNING else RuntimeStatus.STOPPED,
-                    security_score=self._compute_security_score_from_warnings(),
-                )
-            ]
+            self._projects = []
             return
 
         for app in apps:
-            # Map framework enum to string
             framework = app.framework.value if hasattr(app.framework, 'value') else str(app.framework)
             language = self._infer_language_from_framework(framework)
-            database = "unknown"
-            if app.security_boundaries:
+            database = "Not Detected"
+            if hasattr(app, 'security_boundaries'):
                 for boundary in app.security_boundaries:
                     if boundary.type.value == "database" and boundary.description:
-                        # Try to extract database name
                         desc = boundary.description.lower()
                         if "postgres" in desc:
                             database = "PostgreSQL"
@@ -252,25 +500,77 @@ class RuntimeDataProvider:
                         elif "sqlite" in desc:
                             database = "SQLite"
                         break
-            # Attempt to get version from app confidence or other
-            version = "v1.0.0"
-            if app.confidence and app.confidence.evidence:
+
+            # Package manager
+            pm = "Not Detected"
+            if self._fingerprint:
+                pm = self._fingerprint.get("detected", {}).get("package_manager", "Not Detected")
+
+            # Deployment
+            deployment = "Not Detected"
+            if self._fingerprint:
+                dep = self._fingerprint.get("detected", {}).get("deployment", [])
+                if dep:
+                    deployment = ", ".join(dep)
+
+            # Authentication
+            auth = "Not Detected"
+            if self._fingerprint:
+                auth_data = self._fingerprint.get("detected", {}).get("authentication", {})
+                if auth_data:
+                    auth = ", ".join(auth_data.keys()) if isinstance(auth_data, dict) else str(auth_data)
+
+            # OS & Architecture
+            os_info = "Not Detected"
+            arch = "Not Detected"
+            if self._fingerprint:
+                os_info = self._fingerprint.get("os", "Not Detected")
+                arch = self._fingerprint.get("arch", "Not Detected")
+
+            # Runtime version from app
+            version = "Not Detected"
+            if hasattr(app, 'confidence') and app.confidence and hasattr(app.confidence, 'evidence'):
                 for ev in app.confidence.evidence:
                     if "version" in ev.lower():
-                        # crude extraction
                         import re
                         m = re.search(r'v?(\d+\.\d+\.\d+)', ev)
                         if m:
                             version = "v" + m.group(1)
                             break
+
+            # Security score from warnings
+            score = self._compute_security_score_from_warnings()
+
+            # Get status from metrics writer
+            status_str = self.metrics_writer.get_metrics().get("runtime_status", "stopped")
+            try:
+                status = RuntimeStatus(status_str)
+            except ValueError:
+                status = RuntimeStatus.STOPPED
+
+            # Started_at from metrics
+            started_at_str = self.metrics_writer.get_metrics().get("started_at")
+            started_at = datetime.now()
+            if started_at_str:
+                try:
+                    started_at = datetime.fromisoformat(started_at_str)
+                except Exception:
+                    pass
+
             project = Project(
                 name=app.name,
                 framework=framework,
                 language=language,
                 database=database,
+                package_manager=pm,
+                deployment=deployment,
+                authentication=auth,
+                os=os_info,
+                architecture=arch,
                 runtime_version=version,
-                status=self._runtime_config.status,
-                security_score=self._compute_security_score_from_warnings(),
+                status=status,
+                security_score=score,
+                started_at=started_at,
             )
             self._projects.append(project)
 
@@ -287,7 +587,7 @@ class RuntimeDataProvider:
             return "Go"
         if any(x in framework_lower for x in ["actix", "axum", "rocket"]):
             return "Rust"
-        return "unknown"
+        return "Not Detected"
 
     def _build_warnings_from_intelligence(self) -> None:
         """Extract warnings from project intelligence."""
@@ -296,10 +596,9 @@ class RuntimeDataProvider:
             return
 
         # Use intelligence readiness report warnings
-        if self._intelligence.readiness_report:
-            report = self._intelligence.readiness_report
-            # Convert warnings to our Warning model
-            for w in report.warnings:
+        report = getattr(self._intelligence, 'readiness_report', None)
+        if report:
+            for w in getattr(report, 'warnings', []):
                 severity = ThreatSeverity.MEDIUM
                 if "critical" in w.lower() or "urgent" in w.lower():
                     severity = ThreatSeverity.CRITICAL
@@ -314,11 +613,11 @@ class RuntimeDataProvider:
                         description=w,
                         severity=severity,
                         timestamp=datetime.now(),
+                        category="readiness",
                     )
                 )
 
-            # Also check missing requirements
-            for miss in report.missing_requirements:
+            for miss in getattr(report, 'missing_requirements', []):
                 self._warnings.append(
                     Warning(
                         id=f"warn-{len(self._warnings)}",
@@ -326,22 +625,56 @@ class RuntimeDataProvider:
                         description=f"Required for runtime integration: {miss}",
                         severity=ThreatSeverity.HIGH,
                         timestamp=datetime.now(),
+                        category="readiness",
                     )
                 )
 
-        # Add warnings from security boundaries if any
-        if self._intelligence.security_boundaries:
-            for boundary in self._intelligence.security_boundaries[:3]:
-                if boundary.type.value == "authentication" and boundary.confidence and boundary.confidence.score < 0.5:
+        # Add warnings from security boundaries
+        boundaries = getattr(self._intelligence, 'security_boundaries', [])
+        for boundary in boundaries:
+            if boundary.type.value == "authentication" and boundary.confidence and boundary.confidence.score < 0.5:
+                self._warnings.append(
+                    Warning(
+                        id=f"warn-{len(self._warnings)}",
+                        title="Weak Authentication",
+                        description=boundary.description[:100],
+                        severity=ThreatSeverity.HIGH,
+                        timestamp=datetime.now(),
+                        category="security",
+                    )
+                )
+
+        # Add warnings from fingerprint
+        if self._fingerprint:
+            detected = self._fingerprint.get("detected", {})
+            # Debug mode
+            configs = detected.get("config", [])
+            for cfg in configs:
+                if "debug" in cfg.lower():
                     self._warnings.append(
                         Warning(
                             id=f"warn-{len(self._warnings)}",
-                            title="Weak Authentication",
-                            description=boundary.description[:100],
+                            title="Debug Mode Detected",
+                            description=f"Debug mode appears to be enabled in {cfg}",
                             severity=ThreatSeverity.HIGH,
                             timestamp=datetime.now(),
+                            category="configuration",
                         )
                     )
+
+            # Missing HTTPS
+            deployment = detected.get("deployment", [])
+            if not any("https" in d.lower() for d in deployment):
+                self._warnings.append(
+                    Warning(
+                        id=f"warn-{len(self._warnings)}",
+                        title="HTTPS Not Enforced",
+                        description="No HTTPS configuration detected in deployment files.",
+                        severity=ThreatSeverity.MEDIUM,
+                        timestamp=datetime.now(),
+                        category="configuration",
+                    )
+                )
 
     def _compute_security_score_from_warnings(self) -> int:
         """Compute score based on warnings and runtime health."""
@@ -355,26 +688,50 @@ class RuntimeDataProvider:
                 base -= 5
             else:
                 base -= 2
-        # Deduct if runtime is not running
-        if self._runtime_config.status != RuntimeStatus.RUNNING:
+
+        # Runtime health from metrics
+        metrics = self.metrics_writer.get_metrics()
+        health = metrics.get("runtime_health", "unknown")
+        if health == "unhealthy":
+            base -= 15
+        elif health == "degraded":
+            base -= 8
+
+        # Blocked attack ratio
+        total = metrics.get("total_requests", 0)
+        blocked = metrics.get("blocked_requests", 0)
+        if total > 0 and blocked / total > 0.2:
+            base -= 10
+
+        # Runtime status
+        status = metrics.get("runtime_status", "stopped")
+        if status != "running":
             base -= 20
-        # Deduct based on runtime health from metrics if available
-        metrics = self._read_runtime_metrics()
-        if metrics:
-            if metrics.get("health") == "unhealthy":
-                base -= 15
-            elif metrics.get("health") == "degraded":
-                base -= 8
+
         return max(0, min(100, base))
 
-    def _read_runtime_metrics(self) -> Dict[str, Any]:
+    def _read_runtime_metrics(self, force: bool = False) -> Dict[str, Any]:
         """Read runtime_metrics.json if exists."""
         if self._runtime_metrics_path.exists():
             try:
                 with open(self._runtime_metrics_path, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    data = json.load(f)
+                # Update internal config from metrics
+                status = data.get("runtime_status", "stopped")
+                try:
+                    self._runtime_config.status = RuntimeStatus(status)
+                except ValueError:
+                    pass
+                self._runtime_config.version = data.get("version", "Not Detected")
+                started_at_str = data.get("started_at")
+                if started_at_str:
+                    try:
+                        self._runtime_config.started_at = datetime.fromisoformat(started_at_str)
+                    except Exception:
+                        pass
+                return data
+            except Exception as e:
+                logger.error(f"Error reading runtime metrics: {e}")
         return {}
 
     def _read_runtime_events(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -384,14 +741,13 @@ class RuntimeDataProvider:
             try:
                 with open(self._runtime_events_path, "r") as f:
                     lines = f.readlines()
-                    # Read last `limit` lines
                     for line in lines[-limit:]:
                         try:
                             events.append(json.loads(line))
                         except json.JSONDecodeError:
                             pass
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error reading runtime events: {e}")
         return events
 
     # ------------------------------------------------------------------------
@@ -399,52 +755,50 @@ class RuntimeDataProvider:
     # ------------------------------------------------------------------------
 
     def get_projects(self) -> List[Dict[str, Any]]:
-        """Return list of projects."""
-        return [
-            {
-                "name": p.name,
-                "framework": p.framework,
-                "language": p.language,
-                "database": p.database,
-                "runtime_version": p.runtime_version,
-                "started_at": p.started_at.isoformat(),
-                "status": p.status.value,
-                "security_score": p.security_score,
-                "uptime": p.uptime(),
-            }
-            for p in self._projects
-        ]
+        """Return list of projects with full details."""
+        with self._lock:
+            self._build_projects_from_intelligence()  # Refresh projects
+            return [
+                {
+                    "name": p.name,
+                    "framework": p.framework,
+                    "language": p.language,
+                    "database": p.database,
+                    "package_manager": p.package_manager,
+                    "deployment": p.deployment,
+                    "authentication": p.authentication,
+                    "os": p.os,
+                    "architecture": p.architecture,
+                    "runtime_version": p.runtime_version,
+                    "started_at": p.started_at.isoformat(),
+                    "status": p.status.value,
+                    "security_score": p.security_score,
+                    "uptime": p.uptime(),
+                }
+                for p in self._projects
+            ]
 
     def get_runtime_status(self) -> Dict[str, Any]:
         """Return current runtime status."""
-        # Check if runtime_metrics.json indicates status
-        metrics = self._read_runtime_metrics()
-        if metrics:
-            status_str = metrics.get("runtime_status", "stopped")
-            try:
-                status = RuntimeStatus(status_str)
-                self._runtime_config.status = status
-            except ValueError:
-                pass
-            # Update started_at if present
-            if "started_at" in metrics:
-                try:
-                    self._runtime_config.started_at = datetime.fromisoformat(metrics["started_at"])
-                except Exception:
-                    pass
-            if "version" in metrics:
-                self._runtime_config.version = metrics["version"]
-
+        metrics = self.metrics_writer.get_metrics()
+        status = metrics.get("runtime_status", "stopped")
+        version = metrics.get("version", "Not Detected")
+        started_at_str = metrics.get("started_at", "")
+        uptime = metrics.get("uptime", 0)
+        try:
+            status_obj = RuntimeStatus(status)
+        except ValueError:
+            status_obj = RuntimeStatus.STOPPED
         return {
-            "status": self._runtime_config.status.value,
-            "version": self._runtime_config.version,
-            "started_at": self._runtime_config.started_at.isoformat(),
-            "uptime": self._runtime_config.started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status_obj.value,
+            "version": version,
+            "started_at": started_at_str,
+            "uptime": str(timedelta(seconds=uptime)) if uptime else "Not Running",
         }
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return request metrics from runtime_metrics.json."""
-        metrics = self._read_runtime_metrics()
+        metrics = self.metrics_writer.get_metrics()
         total = metrics.get("total_requests", 0)
         blocked = metrics.get("blocked_requests", 0)
         allowed = metrics.get("allowed_requests", 0)
@@ -463,7 +817,6 @@ class RuntimeDataProvider:
         events = self._read_runtime_events(limit=100)
         threats = []
         for ev in events:
-            # Map event to threat
             severity_str = ev.get("severity", "info")
             try:
                 severity = ThreatSeverity(severity_str)
@@ -485,39 +838,42 @@ class RuntimeDataProvider:
                 reason=ev.get("reason", "No reason provided"),
                 decision=decision,
                 source_ip=ev.get("source_ip", "0.0.0.0"),
+                latency_ms=ev.get("latency_ms", 0.0),
             )
             threats.append(threat)
-        # Return as dict list
-        return [t.to_dict() for t in threats]
+        return [t.to_dict() for t in threats[-50:]]
 
     def get_warnings(self) -> List[Dict[str, Any]]:
         """Return warnings from project intelligence."""
-        # Ensure warnings are up-to-date with latest intelligence
-        self._build_warnings_from_intelligence()
-        return [w.to_dict() for w in self._warnings]
+        with self._lock:
+            self._build_warnings_from_intelligence()
+            return [w.to_dict() for w in self._warnings]
 
     def get_performance(self) -> Dict[str, Any]:
         """Return performance from runtime_metrics.json."""
-        metrics = self._read_runtime_metrics()
+        metrics = self.metrics_writer.get_metrics()
+        total = metrics.get("total_requests", 0)
+        blocked = metrics.get("blocked_requests", 0)
         return {
-            "cpu_percent": metrics.get("cpu_percent", 0.0),
-            "memory_mb": metrics.get("memory_mb", 0.0),
+            "cpu_percent": metrics.get("cpu_usage", 0.0),
+            "memory_mb": metrics.get("memory_usage", 0.0),
             "avg_scan_time_ms": metrics.get("avg_scan_time_ms", 0.0),
             "avg_runtime_cost_ms": metrics.get("avg_runtime_cost_ms", 0.0),
-            "requests_processed": metrics.get("requests_processed", 0),
-            "requests_blocked": metrics.get("requests_blocked", 0),
-            "requests_allowed": metrics.get("requests_allowed", 0),
+            "requests_processed": total,
+            "requests_blocked": blocked,
+            "requests_allowed": total - blocked,
+            "blocked_percent": round((blocked / total * 100) if total > 0 else 0, 1),
+            "uptime_seconds": metrics.get("uptime", 0),
         }
 
-    def get_security_score(self) -> int:
-        """Compute security score from warnings and runtime health."""
-        # Recalculate to reflect latest state
-        return self._compute_security_score_from_warnings()
+    def get_security_score(self) -> Dict[str, Any]:
+        """Return security score with breakdown."""
+        score = self._compute_security_score_from_warnings()
+        breakdown = getattr(self, "_score_breakdown", {"deductions": []})
+        return {"score": score, "breakdown": breakdown.get("deductions", [])}
 
     def get_dashboard_data(self) -> Dict[str, Any]:
         """Aggregate all data for WebSocket push."""
-        # Update runtime status from metrics file
-        self.get_runtime_status()  # triggers refresh
         return {
             "projects": self.get_projects(),
             "runtime": self.get_runtime_status(),
@@ -525,7 +881,7 @@ class RuntimeDataProvider:
             "threats": self.get_threats(),
             "warnings": self.get_warnings(),
             "performance": self.get_performance(),
-            "security_score": self.get_security_score(),
+            "security_score": self.get_security_score()["score"],
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -535,19 +891,16 @@ class RuntimeDataProvider:
             new_status = RuntimeStatus(status)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status")
-
-        # Update internal state
+        self.metrics_writer.set_status(status)
+        # Also update internal config
         self._runtime_config.status = new_status
-        # Write to runtime_metrics.json
-        metrics = self._read_runtime_metrics()
-        metrics["runtime_status"] = status
-        if status == "running":
-            metrics["started_at"] = datetime.now().isoformat()
-        try:
-            with open(self._runtime_metrics_path, "w") as f:
-                json.dump(metrics, f, indent=2)
-        except Exception as e:
-            print(f"Failed to write runtime metrics: {e}")
+
+    def stop(self) -> None:
+        """Stop file watcher and metrics writer."""
+        self._stop_watch = True
+        if self._file_watch_thread:
+            self._file_watch_thread.join(timeout=2)
+        self.metrics_writer.stop()
 
 
 # ============================================================================
@@ -564,7 +917,7 @@ active_connections: Set[WebSocket] = set()
 
 
 # ----------------------------------------------------------------------------
-# HTML Dashboard (unchanged)
+# HTML Dashboard (unchanged - kept as-is)
 # ----------------------------------------------------------------------------
 
 DASHBOARD_HTML = """
@@ -961,6 +1314,32 @@ DASHBOARD_HTML = """
         .status-stopped { background: #7f1d1d; color: #fca5a5; }
         .status-error { background: #7f1d1d; color: #fca5a5; }
 
+        /* Project details panel */
+        .project-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin-top: 12px;
+            background: #0b0e11;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #1f2a33;
+        }
+        .project-detail-item {
+            font-size: 13px;
+        }
+        .project-detail-item .label {
+            color: #7a8a9a;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .project-detail-item .value {
+            color: #e5e7eb;
+            font-weight: 500;
+            margin-top: 2px;
+        }
+
         /* Responsive */
         @media (max-width: 900px) {
             .sidebar { width: 60px; padding: 16px 8px; }
@@ -1039,6 +1418,17 @@ DASHBOARD_HTML = """
         </div>
     </div>
 
+    <!-- Project Details Panel -->
+    <div class="panel" style="margin-bottom:24px;">
+        <div class="panel-title">
+            <span>📋 Project Details</span>
+            <span class="count" id="project-count">0 projects</span>
+        </div>
+        <div id="project-details-container">
+            <div class="empty">No project data available</div>
+        </div>
+    </div>
+
     <!-- 2-col: Graph + Timeline -->
     <div class="grid-2col">
         <!-- Request Graph -->
@@ -1071,7 +1461,7 @@ DASHBOARD_HTML = """
                 <span class="count">endpoint severity</span>
             </div>
             <div id="heatmap-container">
-                <div class="empty">Loading heatmap...</div>
+                <div class="empty">No attack data</div>
             </div>
         </div>
 
@@ -1107,6 +1497,7 @@ DASHBOARD_HTML = """
                 <div><span style="color:#7a8a9a;font-size:13px;">Runtime Cost</span><br><span id="perf-cost" style="font-weight:600;">-</span></div>
                 <div><span style="color:#7a8a9a;font-size:13px;">Requests</span><br><span id="perf-reqs" style="font-weight:600;">-</span></div>
                 <div><span style="color:#7a8a9a;font-size:13px;">Blocked %</span><br><span id="perf-blocked" style="font-weight:600;">-</span></div>
+                <div><span style="color:#7a8a9a;font-size:13px;">Uptime</span><br><span id="perf-uptime" style="font-weight:600;">-</span></div>
             </div>
         </div>
 
@@ -1229,8 +1620,8 @@ function updateDashboard(data) {
     document.getElementById('perf-scan').textContent = perf.avg_scan_time_ms + ' ms';
     document.getElementById('perf-cost').textContent = perf.avg_runtime_cost_ms + ' ms';
     document.getElementById('perf-reqs').textContent = perf.requests_processed || 0;
-    const blockPct = perf.requests_processed > 0 ? ((perf.requests_blocked / perf.requests_processed) * 100).toFixed(1) : 0;
-    document.getElementById('perf-blocked').textContent = blockPct + '%';
+    document.getElementById('perf-blocked').textContent = perf.blocked_percent + '%';
+    document.getElementById('perf-uptime').textContent = perf.uptime_seconds ? formatUptime(perf.uptime_seconds) : '0s';
 
     // Warnings
     renderWarnings(warnings);
@@ -1245,6 +1636,18 @@ function updateDashboard(data) {
     document.getElementById('threat-count').textContent = threats.length;
     document.getElementById('blocked-count').textContent = threats.filter(t => t.decision === 'block').length;
     document.getElementById('warnings-count').textContent = warnings.length;
+
+    // Project details
+    renderProjectDetails(projects);
+}
+
+function formatUptime(seconds) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return h + 'h ' + m + 'm';
+    if (m > 0) return m + 'm ' + s + 's';
+    return s + 's';
 }
 
 // ============================================================
@@ -1270,6 +1673,7 @@ function renderTimeline(threats) {
                 <span class="path">${t.method} ${t.path}</span>
                 <span class="decision ${decisionClass}">${t.decision.toUpperCase()}</span>
                 <br><span style="color:#7a8a9a;font-size:12px;">${t.reason} (${t.source_ip})</span>
+                ${t.latency_ms ? `<span style="color:#7a8a9a;font-size:11px;margin-left:8px;">${t.latency_ms}ms</span>` : ''}
             </div>
         </div>`;
     }
@@ -1344,6 +1748,39 @@ function renderWarnings(warnings) {
             <div><strong>${w.title}</strong><br><span style="color:#7a8a9a;font-size:12px;">${w.description}</span></div>
         </div>`;
     }
+    container.innerHTML = html;
+}
+
+function renderProjectDetails(projects) {
+    const container = document.getElementById('project-details-container');
+    document.getElementById('project-count').textContent = projects.length + ' projects';
+    if (!projects || projects.length === 0) {
+        container.innerHTML = '<div class="empty">No project data available</div>';
+        return;
+    }
+    const p = projects[0]; // show first project details
+    let html = '<div class="project-details">';
+    const fields = [
+        { label: 'Name', value: p.name },
+        { label: 'Framework', value: p.framework },
+        { label: 'Language', value: p.language },
+        { label: 'Database', value: p.database },
+        { label: 'Package Manager', value: p.package_manager },
+        { label: 'Deployment', value: p.deployment },
+        { label: 'Authentication', value: p.authentication },
+        { label: 'OS', value: p.os },
+        { label: 'Architecture', value: p.architecture },
+        { label: 'Runtime Version', value: p.runtime_version },
+    ];
+    for (const f of fields) {
+        if (f.value && f.value !== 'Not Detected') {
+            html += `<div class="project-detail-item">
+                <div class="label">${f.label}</div>
+                <div class="value">${f.value}</div>
+            </div>`;
+        }
+    }
+    html += '</div>';
     container.innerHTML = html;
 }
 
@@ -1428,7 +1865,7 @@ window.addEventListener('resize', () => {
 
 
 # ----------------------------------------------------------------------------
-# API Endpoints
+# API Endpoints (unchanged)
 # ----------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
@@ -1482,7 +1919,7 @@ async def api_performance():
 async def api_security_score():
     if data_provider is None:
         raise HTTPException(status_code=503, detail="Data provider not initialized")
-    return {"score": data_provider.get_security_score()}
+    return data_provider.get_security_score()
 
 
 @app.get("/api/health")
@@ -1497,31 +1934,21 @@ async def api_runtime_action(action: str):
     valid_actions = {"start", "pause", "stop", "restart", "reload"}
     if action not in valid_actions:
         raise HTTPException(status_code=400, detail="Invalid action")
-    # Map actions to status changes
-    status_map = {
-        "start": "running",
-        "pause": "paused",
-        "stop": "stopped",
-        "restart": "running",
-        "reload": None,
-    }
-    if action == "restart":
+    
+    if action == "start":
         data_provider.set_runtime_status("running")
-        # Also reset start time
-        metrics = data_provider._read_runtime_metrics()
-        metrics["started_at"] = datetime.now().isoformat()
-        try:
-            with open("runtime_metrics.json", "w") as f:
-                json.dump(metrics, f, indent=2)
-        except Exception:
-            pass
+    elif action == "pause":
+        data_provider.set_runtime_status("paused")
+    elif action == "stop":
+        data_provider.set_runtime_status("stopped")
+    elif action == "restart":
+        data_provider.set_runtime_status("running")
+        # reset start time in metrics
+        data_provider.metrics_writer.set_status("running")
     elif action == "reload":
         # Reload policies - just a placeholder
         pass
-    else:
-        new_status = status_map.get(action)
-        if new_status:
-            data_provider.set_runtime_status(new_status)
+    
     return {"status": "ok", "action": action}
 
 
@@ -1559,13 +1986,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             data_provider.set_runtime_status("stopped")
                         elif action == "restart":
                             data_provider.set_runtime_status("running")
-                            metrics = data_provider._read_runtime_metrics()
-                            metrics["started_at"] = datetime.now().isoformat()
-                            try:
-                                with open("runtime_metrics.json", "w") as f:
-                                    json.dump(metrics, f, indent=2)
-                            except Exception:
-                                pass
+                            data_provider.metrics_writer.set_status("running")
                         elif action == "reload":
                             pass
                 except json.JSONDecodeError:
@@ -1581,7 +2002,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         active_connections.remove(websocket)
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
         active_connections.discard(websocket)
 
 
@@ -1590,6 +2011,8 @@ async def websocket_endpoint(websocket: WebSocket):
 # ============================================================================
 
 def open_browser():
+    # Wait a moment for server to start
+    time.sleep(1)
     webbrowser.open("http://localhost:8080")
 
 
@@ -1612,10 +2035,15 @@ def main():
     print("\nDashboard: http://localhost:8080")
     print("=" * 60)
 
-    # Open browser after a short delay
-    Thread(target=open_browser, daemon=True).start()
+    # Open browser after server starts (from separate thread)
+    browser_thread = Thread(target=open_browser, daemon=True)
+    browser_thread.start()
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8080)
+    finally:
+        if data_provider:
+            data_provider.stop()
 
 
 if __name__ == "__main__":
