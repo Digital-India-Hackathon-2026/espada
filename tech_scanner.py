@@ -43,18 +43,51 @@ _LANG_MAP = {
 _NODE_FRAMEWORKS = [
     ("react", "React"), ("vue", "Vue"), ("@angular/core", "Angular"),
     ("next", "Next.js"), ("nuxt", "Nuxt"), ("svelte", "Svelte"),
+    ("svelte-kit", "SvelteKit"), ("solid-js", "SolidJS"),
     ("express", "Express"), ("fastify", "Fastify"),
+    ("@nestjs/core", "NestJS"),
 ]
+
+# Database detection for Node.js package names (covers pg, mongoose, etc.)
+_NODE_DB_PACKAGES = {
+    "pg": "PostgreSQL", "postgres": "PostgreSQL", "pg-hstore": "PostgreSQL",
+    "mysql2": "MySQL", "mysql": "MySQL", "sequelize": "PostgreSQL",
+    "typeorm": "PostgreSQL", "prisma": "PostgreSQL",
+    "mongoose": "MongoDB", "mongodb": "MongoDB", "@mongodb-js/mongodb": "MongoDB",
+    "redis": "Redis", "ioredis": "Redis", "redis-om": "Redis",
+    "fakeredis": "Redis", "hiredis": "Redis",
+    "mariadb": "MariaDB", "mysql2": "MySQL",
+    "pg": "PostgreSQL", "node-postgres": "PostgreSQL",
+}
 
 _RUST_FRAMEWORKS = [
     ("actix-web", "Actix Web"), ("axum", "Axum"),
     ("tokio", "Tokio"), ("rocket", "Rocket"),
 ]
 
+# Database detection for Rust crates
+_RUST_DB_CRATES = {
+    "tokio-postgres": "PostgreSQL", "postgres": "PostgreSQL", "sqlx": "PostgreSQL",
+    "mongodb": "MongoDB", "bson": "MongoDB",
+    "redis": "Redis", "redis-async": "Redis",
+    "diesel": "PostgreSQL", "sea-orm": "PostgreSQL",
+    "rusqlite": "SQLite",
+}
+
 _PYTHON_PACKAGE_FRAMEWORKS = [
     ("django", "Django"), ("fastapi", "FastAPI"),
     ("flask", "Flask"), ("quart", "Quart"),
 ]
+
+# Database detection for Python packages (from requirements.txt/pyproject.toml)
+_PYTHON_DB_PACKAGES = {
+    "psycopg2": "PostgreSQL", "psycopg": "PostgreSQL", "asyncpg": "PostgreSQL",
+    "sqlalchemy": "PostgreSQL", "alembic": "PostgreSQL",
+    "mysql-connector-python": "MySQL", "mysqlclient": "MySQL",
+    "pymongo": "MongoDB", "motor": "MongoDB", "bson": "MongoDB",
+    "redis-py": "Redis", "redis": "Redis", "hiredis": "Redis",
+    "fakeredis": "Redis", "mariadb": "MariaDB", "mysql-connector": "MySQL",
+}
 
 _GO_FRAMEWORKS = [
     ("gin-gonic/gin", "Gin"), ("labstack/echo", "Echo"),
@@ -64,6 +97,15 @@ _GO_FRAMEWORKS = [
 _JAVA_FRAMEWORKS = [("spring-boot", "Spring Boot")]
 
 _PHP_FRAMEWORKS = [("laravel", "Laravel"), ("symfony", "Symfony")]
+
+# Database detection for PHP packages (composer.json)
+_PHP_DB_PACKAGES = {
+    "mongodb/mongodb": "MongoDB", "ext-mongodb": "MongoDB",
+    "predis/predis": "Redis", "phpredis": "Redis", "predis/redis": "Redis",
+    "vlucas/phpdotenv": ".env",
+    "doctrine/dbal": "PostgreSQL", "doctrine/orm": "PostgreSQL",
+    "mysqli": "MySQL", "ext-mysqli": "MySQL", "ext-pdo_mysql": "MySQL",
+}
 
 # Python app entry-point candidates — checked first to avoid scanning every file.
 _APP_ENTRY_POINTS = frozenset((
@@ -77,6 +119,64 @@ _LANG_PRIORITY = [
     "Python", "TypeScript", "JavaScript", "Rust", "Go", "Java",
     "Ruby", "PHP", "C#", "C++", "C",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Version extraction helpers
+# ---------------------------------------------------------------------------
+
+def _extract_node_version(dep_name: str, version_spec: str) -> str:
+    """Extract a clean semantic-ish version from an npm version spec.
+
+    Strips ^ ~ >= <= = prefixes and returns the bare version string.
+    Returns empty string if no version-like content found.
+    """
+    # Strip leading ranges/operators: ^, ~, >=, <=, =, >, <, ||, &
+    cleaned = re.sub(r'^[~^>=<\s]+', '', version_spec)
+    cleaned = re.sub(r'[|&].*', '', cleaned)  # take first part if || exists
+    # Strip v prefix
+    cleaned = cleaned.lstrip('v')
+    return cleaned
+
+
+def _extract_python_version(dep_line: str) -> str:
+    """Extract version from a pip-style specifier like 'django==5.0.4' or 'flask>=2.0'.
+
+    Returns the first matched version number (e.g. '5.0.4').
+    """
+    m = re.search(r'[><=~!]+\s*([0-9][0-9a-zA-Z.*]*)', dep_line)
+    return m.group(1).rstrip('.').rstrip('*') if m else ""
+
+
+def _extract_rust_version(toml_content: str, crate_name: str) -> str | None:
+    """Simple TOML parser for a single dependency's version field."""
+    # Match [dependencies.package] or package = { version = "x.y.z" }
+    pattern = rf'^{re.escape(crate_name)}\s*=\s*(?:"([^"]+)"|\{{.*?\bversion\s*=\s*"([^"]+)"}})'
+    m = re.search(pattern, toml_content, re.MULTILINE | re.DOTALL)
+    if m:
+        version = m.group(1) or m.group(2)
+        # Strip ^ ~ >= operators
+        return re.sub(r'^[~^>=<]+', '', version or '')
+    return None
+
+
+def _extract_go_version(content: str, module: str) -> str | None:
+    """Extract version from go.mod require block."""
+    pattern = rf'(?:^|\n)\s*{re.escape(module)}\s+v([0-9][^\s]+)'
+    m = re.search(pattern, content)
+    return m.group(1) if m else None
+
+
+def _extract_java_version(content: str, artifact: str) -> str | None:
+    """Extract version from pom.xml <version> tag near a given artifact."""
+    # Simple approach: find <artifactId>...<version>... block
+    pattern = rf'<artifactId>\s*{re.escape(artifact)}\s*</artifactId>'
+    m = re.search(pattern, content)
+    if not m:
+        return None
+    snippet = content[m.end():m.end() + 200]
+    vm = re.search(r'<version>\s*([0-9][^\s<]*)', snippet)
+    return vm.group(1) if vm else None
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +207,16 @@ def _scan_package_json(filepath: str, detected: dict, verbose: bool = False):
 
     for dep, name in _NODE_FRAMEWORKS:
         if dep in deps and name not in detected["frameworks"]:
-            detected["frameworks"].append(name)
+            version_str = _extract_node_version(dep, deps[dep])
+            entry = f"{name}"
+            if version_str:
+                entry += f" ({version_str})"
+            detected["frameworks"].append(entry)
+
+    # Detect databases from Node.js package names
+    for pkg_name, db_name in _NODE_DB_PACKAGES.items():
+        if pkg_name in deps and db_name not in detected["databases"]:
+            detected["databases"].append(db_name)
 
 
 def _scan_cargo_toml(filepath: str, detected: dict, verbose: bool = False):
@@ -129,6 +238,12 @@ def _scan_cargo_toml(filepath: str, detected: dict, verbose: bool = False):
         if key in content and name not in detected["frameworks"]:
             detected["frameworks"].append(name)
 
+    # Detect databases from Rust crates
+    for crate, db_name in _RUST_DB_CRATES.items():
+        version = _extract_rust_version(content, crate)
+        if (crate in content or f'{crate} = ' in content) and db_name not in detected["databases"]:
+            detected["databases"].append(db_name)
+
 
 def _scan_python_manifest(filepath: str, detected: dict, verbose: bool = False):
     """Parse requirements.txt / Pipfile / pyproject.toml / setup.py."""
@@ -139,15 +254,30 @@ def _scan_python_manifest(filepath: str, detected: dict, verbose: bool = False):
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
+            lines = f.readlines()
     except Exception:
         if verbose:
             _log_verbose(f"  [!] unreadable {filepath}")
         return
 
+    # Framework detection from content
+    full_content = "".join(lines)
     for key, name in _PYTHON_PACKAGE_FRAMEWORKS:
-        if key in content.lower() and name not in detected["frameworks"]:
+        if key in full_content.lower() and name not in detected["frameworks"]:
             detected["frameworks"].append(name)
+
+    # Database detection from Python package names (requirements.txt / pyproject.toml)
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Strip extras like [security], markers like ; python_version >= "3.8"
+        pkg_part = re.split(r'[>!=<;\[]', line)[0].strip()
+        version_str = _extract_python_version(line)
+        for pkg_name, db_name in _PYTHON_DB_PACKAGES.items():
+            if pkg_name.lower() in pkg_part.lower():
+                if db_name not in detected["databases"]:
+                    detected["databases"].append(db_name)
 
 
 def _scan_go_mod(filepath: str, detected: dict, verbose: bool = False):
@@ -187,9 +317,16 @@ def _scan_java_manifest(filepath: str, detected: dict, verbose: bool = False):
             if verbose:
                 _log_verbose(f"  [!] unreadable {filepath}")
             return
-        for key, name in _JAVA_FRAMEWORKS:
-            if key in content and name not in detected["frameworks"]:
-                detected["frameworks"].append(name)
+
+        # Extract dependencies versions (Fix #1)
+        dep_pattern = r'<dependency>\s*<groupId>([^<]+)</groupId>\s*<artifactId>([^<]+)</artifactId>\s*<version>([^<]*)</version>'
+        for m in re.finditer(dep_pattern, content, re.DOTALL):
+            group_id = m.group(1).strip()
+            artifact_id = m.group(2).strip()
+            version = m.group(3).strip()
+
+            if "spring-boot" in group_id and "Spring Boot" not in detected["frameworks"]:
+                detected["frameworks"].append(f"Spring Boot ({version})")
 
 
 def _scan_composer(filepath: str, detected: dict, verbose: bool = False):
@@ -203,11 +340,35 @@ def _scan_composer(filepath: str, detected: dict, verbose: bool = False):
     except Exception:
         if verbose:
             _log_verbose(f"  [!] unreadable {filepath}")
-        return
+            return
+
+    pkg = json.loads(content)
+    deps = {**pkg.get("require", {}), **pkg.get("require-dev", {})}
 
     for key, name in _PHP_FRAMEWORKS:
-        if key in content.lower() and name not in detected["frameworks"]:
-            detected["frameworks"].append(name)
+        dep_name = None
+        for d in deps:
+            if key in d.lower():
+                dep_name = d
+                break
+        if dep_name and name not in detected["frameworks"]:
+            version_str = deps[dep_name]
+            # Strip ^ ~ >= operators for cleaner display
+            clean_ver = re.sub(r'^[~^>=<\s]+', '', str(version_str))
+            entry = f"{name}"
+            if clean_ver and not clean_ver.startswith("*"):
+                entry += f" ({clean_ver})"
+            detected["frameworks"].append(entry)
+
+    # Detect databases from PHP packages
+    for pkg_name, db_name in _PHP_DB_PACKAGES.items():
+        dep_name = None
+        for d in deps:
+            if pkg_name.lower() in d.lower():
+                dep_name = d
+                break
+        if dep_name and db_name not in detected["databases"]:
+            detected["databases"].append(db_name)
 
 
 def _scan_gemfile(filepath: str, detected: dict, verbose: bool = False):
@@ -228,6 +389,91 @@ def _scan_gemfile(filepath: str, detected: dict, verbose: bool = False):
         if "Ruby on Rails" not in detected["frameworks"]:
             detected["frameworks"].append("Ruby on Rails")
         languages["Ruby"] = True
+
+
+def _scan_dart_pubspec(filepath: str, detected: dict, verbose: bool = False):
+    """Parse pubspec.yaml for Dart/Flutter frameworks."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "pub"
+    languages["Dart"] = True
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    # Detect Flutter framework
+    if "flutter:" in content.lower():
+        detected["frameworks"].append("Flutter")
+        languages["Dart"] = True
+
+    # Check for common Flutter web/db packages under dependencies:
+    deps_section = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("dependencies:") or stripped == "dependencies:":
+            deps_section = True
+            continue
+        if deps_section and (stripped.startswith("dev_dependencies:") or stripped.startswith("flutter:") or not line[0].isspace()):
+            deps_section = False
+
+        if deps_section and ":" in stripped and not stripped.startswith("#"):
+            pkg_name = stripped.split(":")[0].strip()
+            if pkg_name in ("http", "dio"):
+                if "HTTP Client" not in detected["frameworks"]:
+                    detected["frameworks"].append("HTTP Client")
+
+
+def _scan_mix_exs(filepath: str, detected: dict, verbose: bool = False):
+    """Parse mix.exs for Elixir/Phoenix frameworks."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Hex"
+    languages["Elixir"] = True
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    if "phoenix" in content.lower():
+        detected["frameworks"].append("Phoenix")
+        languages["Elixir"] = True
+
+
+def _scan_kotlin_gradle(filepath: str, detected: dict, verbose: bool = False):
+    """Parse build.gradle.kts for Kotlin frameworks (Ktor, Quarkus)."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Gradle"
+    # Only mark as Java/Kotlin if there are actual .kt/.java files later.
+    # Don't auto-detect language here — Gradle is shared by both.
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    # Ktor detection
+    for ktor_dep in ("io.ktor:ktor", "ktor-server", "ktor-client"):
+        if ktor_dep in content and "Ktor" not in detected["frameworks"]:
+            detected["frameworks"].append("Ktor")
+            break
+
+    # Quarkus detection
+    if any(q in content for q in ("io.quarkus", "quarkus-hibernate", "quarkus-resteasy")):
+        if "Quarkus" not in detected["frameworks"]:
+            detected["frameworks"].append("Quarkus")
 
 
 def _find_python_version(project_path: str, verbose: bool = False) -> str | None:
@@ -303,6 +549,7 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
     pyproject_paths: list[str] = []       # collect during walk (Fix #8)
     app_py_files: list[tuple[str, str]] = []  # entry points found
     other_py_files: list[tuple[str, str]] = []  # everything else
+    kotlin_gradle_files: list[tuple[str, str]] = []     # for Kotlin frameworks
 
     for root, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs if d not in _EXCLUDED_DIRS]
@@ -326,7 +573,9 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
             elif filename == "go.mod":
                 _scan_go_mod(filepath, detected, verbose)
 
-            elif filename in ("pom.xml", "build.gradle", "build.gradle.kts"):
+            # Kotlin Gradle files need separate handling for Ktor/Quarkus
+            elif filename in ("build.gradle", "build.gradle.kts"):
+                kotlin_gradle_files.append((filepath, rel_path))
                 _scan_java_manifest(filepath, detected, verbose)
 
             elif filename == "composer.json":
@@ -334,6 +583,14 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
 
             elif filename == "Gemfile":
                 _scan_gemfile(filepath, detected, verbose)
+
+            # New: Dart/Flutter
+            elif filename == "pubspec.yaml":
+                _scan_dart_pubspec(filepath, detected, verbose)
+
+            # New: Elixir/Phoenix
+            elif filename == "mix.exs":
+                _scan_mix_exs(filepath, detected, verbose)
 
             # -- Python version (single pass; Fix #8: collected here) ---------
             elif filename == ".python-version":
@@ -429,6 +686,17 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
     # Post-walk processing
     # ------------------------------------------------------------------
 
+    # --- Kotlin frameworks from Gradle files ----------------------------
+    for filepath, rel_path in kotlin_gradle_files:
+        _scan_kotlin_gradle(filepath, detected, verbose)
+
+    # Detect Kotlin language if Gradle file exists + .kt source files present
+    has_kotlin_sources = any(
+        f.endswith(".kt") or f.endswith(".kts") for _, _, fs in os.walk(project_path) for f in fs
+    )
+    if kotlin_gradle_files and has_kotlin_sources:
+        detected["_languages"]["Kotlin"] = True
+
     # --- Database detection from Python imports (Fix #7: entry points first) ---
     for filepath, rel_path in app_py_files + other_py_files:
         _scan_python_imports_db(filepath, detected, verbose)
@@ -440,6 +708,19 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
     # --- Extract internal languages dict ---------------------------------
     languages = {k: v for k, v in detected.pop("_languages").items()}
     detected["frameworks"] = list(dict.fromkeys(detected["frameworks"]))  # dedup, preserve order
+
+    # --- Go stdlib-only detection (Fix #2) ------------------------------
+    if detected.get("package_manager") == "Go Modules":
+        has_go_frameworks = any(
+            f.lower() in {"gin", "echo", "fiber"} for f in detected["frameworks"]
+        )
+        if not has_go_frameworks:
+            # Verify there are .go source files (not just go.mod)
+            has_go_sources = any(
+                f.endswith(".go") for _, _, fs in os.walk(project_path) for f in fs
+            )
+            if has_go_sources and "Go" not in detected["frameworks"]:
+                detected["frameworks"].append("Go (stdlib)")
 
     # --- Primary language (Fix #14: priority order) ----------------------
     if detected["frameworks"]:
