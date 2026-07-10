@@ -5,14 +5,14 @@ Security Runtime Dashboard
 Provides a real-time monitoring and management interface for Security Runtime.
 
 Usage:
-    python dashboard.py
+    python dashboard.py [project_path]
 
 Starts the dashboard at http://localhost:8080 and opens the browser.
 """
 
 import asyncio
 import json
-import random
+import os
 import time
 import webbrowser
 from dataclasses import dataclass, field
@@ -20,10 +20,26 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 from threading import Thread
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse
 import uvicorn
+
+# ============================================================================
+# Attempt to import existing project components
+# ============================================================================
+
+try:
+    import tech_scanner
+except ImportError:
+    tech_scanner = None
+
+try:
+    from project_intelligence import analyze_project, ProjectIntelligence
+except ImportError:
+    analyze_project = None
+    ProjectIntelligence = None
 
 # ============================================================================
 # Data Models
@@ -141,94 +157,249 @@ class RuntimeConfig:
 
 
 # ============================================================================
-# Data Provider (Simulation)
+# Real Data Provider
 # ============================================================================
 
-class SimulationDataProvider:
-    """Simulates runtime data for the dashboard until Phase 4 integration."""
+class RuntimeDataProvider:
+    """Provides real project data from technology detector and intelligence engine,
+       and reads runtime metrics/events from files.
+    """
 
-    def __init__(self):
+    def __init__(self, project_path: str = "."):
+        self.project_path = project_path
         self._projects: List[Project] = []
-        self._threats: List[Threat] = []
         self._warnings: List[Warning] = []
-        self._request_metrics = RequestMetrics()
-        self._performance = PerformanceMetrics()
-        self._runtime_config = RuntimeConfig()
-        self._security_score = 85
-        self._started_at = datetime.now()
-        self._threat_id_counter = 0
-        self._warning_id_counter = 0
-        self._request_counter = 0
-        self._blocked_counter = 0
+        self._intelligence: Optional[ProjectIntelligence] = None
+        self._runtime_metrics_path = Path("runtime_metrics.json")
+        self._runtime_events_path = Path("runtime_events.jsonl")
+        self._runtime_config = RuntimeConfig(status=RuntimeStatus.STOPPED)
+        self._load_project_intelligence()
 
-        # Seed initial data
-        self._init_projects()
-        self._init_threats()
-        self._init_warnings()
+    def _load_project_intelligence(self) -> None:
+        """Load technology fingerprint and project intelligence."""
+        if tech_scanner is None or analyze_project is None:
+            # Fallback: create a dummy project from environment
+            self._projects = [
+                Project(
+                    name="Unknown Project",
+                    framework="unknown",
+                    language="unknown",
+                    database="unknown",
+                    runtime_version="v0.0.0",
+                    status=RuntimeStatus.STOPPED,
+                    security_score=0,
+                )
+            ]
+            return
 
-    def _init_projects(self) -> None:
-        projects = [
-            Project("Auth Service", "FastAPI", "Python", "PostgreSQL"),
-            Project("Payment Gateway", "Spring Boot", "Java", "MySQL"),
-            Project("Web App", "Flask", "Python", "MongoDB"),
-            Project("API Gateway", "Express", "Node.js", "Redis"),
-        ]
-        self._projects = projects
-        # Update first project as primary
-        self._projects[0].security_score = 92
-        self._projects[0].runtime_version = "v1.2.3"
+        try:
+            fingerprint = tech_scanner.scan_project(self.project_path)
+            self._intelligence = analyze_project(fingerprint)
+            self._build_projects_from_intelligence()
+            self._build_warnings_from_intelligence()
+            # Set runtime version from intelligence if available
+            if self._intelligence and self._intelligence.primary_application:
+                app = self._intelligence.primary_application
+                # Infer version from framework version if present
+                version = "v1.0.0"
+                # Could look at dependencies
+                self._runtime_config.version = version
+        except Exception as e:
+            print(f"Failed to load project intelligence: {e}")
 
-    def _init_threats(self) -> None:
-        threats_data = [
-            ("POST", "/api/login", ThreatSeverity.HIGH, "Suspicious login attempt from unknown IP"),
-            ("GET", "/admin", ThreatSeverity.CRITICAL, "Unauthorized admin access attempt"),
-            ("POST", "/api/payment", ThreatSeverity.MEDIUM, "Payment data with invalid signature"),
-            ("GET", "/api/users", ThreatSeverity.LOW, "Excessive API calls from single IP"),
-            ("POST", "/api/upload", ThreatSeverity.HIGH, "File upload with malicious content"),
-        ]
-        now = datetime.now()
-        for i, (method, path, severity, reason) in enumerate(threats_data):
-            ts = now - timedelta(minutes=i * 3 + random.randint(0, 2))
-            status = random.choice([ThreatStatus.BLOCKED, ThreatStatus.ACTIVE])
-            decision = "block" if status == ThreatStatus.BLOCKED else "allow"
-            threat = Threat(
-                id=f"threat-{i}",
-                timestamp=ts,
-                method=method,
-                path=path,
-                severity=severity,
-                status=status,
-                reason=reason,
-                decision=decision,
-                source_ip=f"192.168.{random.randint(1,255)}.{random.randint(1,255)}",
+    def _build_projects_from_intelligence(self) -> None:
+        """Convert ProjectIntelligence applications to Project list."""
+        if not self._intelligence:
+            return
+        apps = self._intelligence.applications
+        if not apps:
+            # Create a default project from fingerprint
+            detected = self._intelligence.__dict__.get("detected", {})
+            framework = detected.get("language", "unknown")
+            lang = detected.get("language", "unknown")
+            db = detected.get("databases", ["unknown"])[0] if detected.get("databases") else "unknown"
+            self._projects = [
+                Project(
+                    name="Project",
+                    framework=framework,
+                    language=lang,
+                    database=db,
+                    runtime_version="v1.0.0",
+                    status=RuntimeStatus.RUNNING if self._runtime_config.status == RuntimeStatus.RUNNING else RuntimeStatus.STOPPED,
+                    security_score=self._compute_security_score_from_warnings(),
+                )
+            ]
+            return
+
+        for app in apps:
+            # Map framework enum to string
+            framework = app.framework.value if hasattr(app.framework, 'value') else str(app.framework)
+            language = self._infer_language_from_framework(framework)
+            database = "unknown"
+            if app.security_boundaries:
+                for boundary in app.security_boundaries:
+                    if boundary.type.value == "database" and boundary.description:
+                        # Try to extract database name
+                        desc = boundary.description.lower()
+                        if "postgres" in desc:
+                            database = "PostgreSQL"
+                        elif "mysql" in desc:
+                            database = "MySQL"
+                        elif "mongo" in desc:
+                            database = "MongoDB"
+                        elif "redis" in desc:
+                            database = "Redis"
+                        elif "sqlite" in desc:
+                            database = "SQLite"
+                        break
+            # Attempt to get version from app confidence or other
+            version = "v1.0.0"
+            if app.confidence and app.confidence.evidence:
+                for ev in app.confidence.evidence:
+                    if "version" in ev.lower():
+                        # crude extraction
+                        import re
+                        m = re.search(r'v?(\d+\.\d+\.\d+)', ev)
+                        if m:
+                            version = "v" + m.group(1)
+                            break
+            project = Project(
+                name=app.name,
+                framework=framework,
+                language=language,
+                database=database,
+                runtime_version=version,
+                status=self._runtime_config.status,
+                security_score=self._compute_security_score_from_warnings(),
             )
-            self._threats.append(threat)
-            if decision == "block":
-                self._blocked_counter += 1
-            self._request_counter += 1
+            self._projects.append(project)
 
-    def _init_warnings(self) -> None:
-        warnings_data = [
-            ("Weak JWT Signing", "JWT secret appears to be short (< 32 chars).", ThreatSeverity.HIGH),
-            ("Debug Mode Enabled", "Debug mode is active in production environment.", ThreatSeverity.HIGH),
-            ("Missing HTTPS", "Application is not enforcing HTTPS.", ThreatSeverity.MEDIUM),
-            ("Missing Rate Limiting", "No rate limiting detected on API endpoints.", ThreatSeverity.MEDIUM),
-            ("Weak CORS Policy", "CORS allows all origins (*).", ThreatSeverity.LOW),
-            ("Missing CSP Headers", "Content Security Policy header not set.", ThreatSeverity.LOW),
-        ]
-        now = datetime.now()
-        for i, (title, desc, severity) in enumerate(warnings_data):
-            ts = now - timedelta(hours=i * 2 + random.randint(0, 30))
-            warn = Warning(
-                id=f"warn-{i}",
-                title=title,
-                description=desc,
-                severity=severity,
-                timestamp=ts,
-            )
-            self._warnings.append(warn)
+    def _infer_language_from_framework(self, framework: str) -> str:
+        """Map framework to language."""
+        framework_lower = framework.lower()
+        if any(x in framework_lower for x in ["fastapi", "flask", "django", "quart"]):
+            return "Python"
+        if any(x in framework_lower for x in ["express", "nestjs", "next"]):
+            return "JavaScript/TypeScript"
+        if any(x in framework_lower for x in ["spring", "java"]):
+            return "Java"
+        if any(x in framework_lower for x in ["gin", "echo", "fiber"]):
+            return "Go"
+        if any(x in framework_lower for x in ["actix", "axum", "rocket"]):
+            return "Rust"
+        return "unknown"
+
+    def _build_warnings_from_intelligence(self) -> None:
+        """Extract warnings from project intelligence."""
+        self._warnings = []
+        if not self._intelligence:
+            return
+
+        # Use intelligence readiness report warnings
+        if self._intelligence.readiness_report:
+            report = self._intelligence.readiness_report
+            # Convert warnings to our Warning model
+            for w in report.warnings:
+                severity = ThreatSeverity.MEDIUM
+                if "critical" in w.lower() or "urgent" in w.lower():
+                    severity = ThreatSeverity.CRITICAL
+                elif "high" in w.lower():
+                    severity = ThreatSeverity.HIGH
+                elif "low" in w.lower():
+                    severity = ThreatSeverity.LOW
+                self._warnings.append(
+                    Warning(
+                        id=f"warn-{len(self._warnings)}",
+                        title=w[:50],
+                        description=w,
+                        severity=severity,
+                        timestamp=datetime.now(),
+                    )
+                )
+
+            # Also check missing requirements
+            for miss in report.missing_requirements:
+                self._warnings.append(
+                    Warning(
+                        id=f"warn-{len(self._warnings)}",
+                        title=f"Missing: {miss}",
+                        description=f"Required for runtime integration: {miss}",
+                        severity=ThreatSeverity.HIGH,
+                        timestamp=datetime.now(),
+                    )
+                )
+
+        # Add warnings from security boundaries if any
+        if self._intelligence.security_boundaries:
+            for boundary in self._intelligence.security_boundaries[:3]:
+                if boundary.type.value == "authentication" and boundary.confidence and boundary.confidence.score < 0.5:
+                    self._warnings.append(
+                        Warning(
+                            id=f"warn-{len(self._warnings)}",
+                            title="Weak Authentication",
+                            description=boundary.description[:100],
+                            severity=ThreatSeverity.HIGH,
+                            timestamp=datetime.now(),
+                        )
+                    )
+
+    def _compute_security_score_from_warnings(self) -> int:
+        """Compute score based on warnings and runtime health."""
+        base = 100
+        for w in self._warnings:
+            if w.severity == ThreatSeverity.CRITICAL:
+                base -= 15
+            elif w.severity == ThreatSeverity.HIGH:
+                base -= 10
+            elif w.severity == ThreatSeverity.MEDIUM:
+                base -= 5
+            else:
+                base -= 2
+        # Deduct if runtime is not running
+        if self._runtime_config.status != RuntimeStatus.RUNNING:
+            base -= 20
+        # Deduct based on runtime health from metrics if available
+        metrics = self._read_runtime_metrics()
+        if metrics:
+            if metrics.get("health") == "unhealthy":
+                base -= 15
+            elif metrics.get("health") == "degraded":
+                base -= 8
+        return max(0, min(100, base))
+
+    def _read_runtime_metrics(self) -> Dict[str, Any]:
+        """Read runtime_metrics.json if exists."""
+        if self._runtime_metrics_path.exists():
+            try:
+                with open(self._runtime_metrics_path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _read_runtime_events(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Read last N events from runtime_events.jsonl."""
+        events = []
+        if self._runtime_events_path.exists():
+            try:
+                with open(self._runtime_events_path, "r") as f:
+                    lines = f.readlines()
+                    # Read last `limit` lines
+                    for line in lines[-limit:]:
+                        try:
+                            events.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+            except Exception:
+                pass
+        return events
+
+    # ------------------------------------------------------------------------
+    # Public methods for dashboard
+    # ------------------------------------------------------------------------
 
     def get_projects(self) -> List[Dict[str, Any]]:
+        """Return list of projects."""
         return [
             {
                 "name": p.name,
@@ -245,6 +416,25 @@ class SimulationDataProvider:
         ]
 
     def get_runtime_status(self) -> Dict[str, Any]:
+        """Return current runtime status."""
+        # Check if runtime_metrics.json indicates status
+        metrics = self._read_runtime_metrics()
+        if metrics:
+            status_str = metrics.get("runtime_status", "stopped")
+            try:
+                status = RuntimeStatus(status_str)
+                self._runtime_config.status = status
+            except ValueError:
+                pass
+            # Update started_at if present
+            if "started_at" in metrics:
+                try:
+                    self._runtime_config.started_at = datetime.fromisoformat(metrics["started_at"])
+                except Exception:
+                    pass
+            if "version" in metrics:
+                self._runtime_config.version = metrics["version"]
+
         return {
             "status": self._runtime_config.status.value,
             "version": self._runtime_config.version,
@@ -253,44 +443,81 @@ class SimulationDataProvider:
         }
 
     def get_metrics(self) -> Dict[str, Any]:
-        # Simulate changing metrics
-        self._simulate_requests()
+        """Return request metrics from runtime_metrics.json."""
+        metrics = self._read_runtime_metrics()
+        total = metrics.get("total_requests", 0)
+        blocked = metrics.get("blocked_requests", 0)
+        allowed = metrics.get("allowed_requests", 0)
+        rate = metrics.get("requests_per_second", 0.0)
+        latency = metrics.get("average_latency_ms", 0.0)
         return {
-            "total_requests": self._request_counter,
-            "blocked_requests": self._blocked_counter,
-            "allowed_requests": self._request_counter - self._blocked_counter,
-            "rate_per_second": round(random.uniform(5, 50), 1),
-            "avg_latency_ms": round(random.uniform(20, 150), 1),
+            "total_requests": total,
+            "blocked_requests": blocked,
+            "allowed_requests": allowed,
+            "rate_per_second": round(rate, 1),
+            "avg_latency_ms": round(latency, 1),
         }
 
     def get_threats(self) -> List[Dict[str, Any]]:
-        # Occasionally add a new threat
-        if random.random() < 0.15:
-            self._add_random_threat()
-        return [t.to_dict() for t in self._threats[-50:]]
+        """Convert runtime events to threat format."""
+        events = self._read_runtime_events(limit=100)
+        threats = []
+        for ev in events:
+            # Map event to threat
+            severity_str = ev.get("severity", "info")
+            try:
+                severity = ThreatSeverity(severity_str)
+            except ValueError:
+                severity = ThreatSeverity.INFO
+            status_str = ev.get("status", "blocked")
+            try:
+                status = ThreatStatus(status_str)
+            except ValueError:
+                status = ThreatStatus.BLOCKED
+            decision = ev.get("decision", "block")
+            threat = Threat(
+                id=ev.get("id", f"evt-{len(threats)}"),
+                timestamp=datetime.fromisoformat(ev["timestamp"]) if "timestamp" in ev else datetime.now(),
+                method=ev.get("method", "UNKNOWN"),
+                path=ev.get("path", "/"),
+                severity=severity,
+                status=status,
+                reason=ev.get("reason", "No reason provided"),
+                decision=decision,
+                source_ip=ev.get("source_ip", "0.0.0.0"),
+            )
+            threats.append(threat)
+        # Return as dict list
+        return [t.to_dict() for t in threats]
 
     def get_warnings(self) -> List[Dict[str, Any]]:
+        """Return warnings from project intelligence."""
+        # Ensure warnings are up-to-date with latest intelligence
+        self._build_warnings_from_intelligence()
         return [w.to_dict() for w in self._warnings]
 
     def get_performance(self) -> Dict[str, Any]:
-        self._update_performance()
+        """Return performance from runtime_metrics.json."""
+        metrics = self._read_runtime_metrics()
         return {
-            "cpu_percent": self._performance.cpu_percent,
-            "memory_mb": self._performance.memory_mb,
-            "avg_scan_time_ms": self._performance.avg_scan_time_ms,
-            "avg_runtime_cost_ms": self._performance.avg_runtime_cost_ms,
-            "requests_processed": self._performance.requests_processed,
-            "requests_blocked": self._performance.requests_blocked,
-            "requests_allowed": self._performance.requests_allowed,
+            "cpu_percent": metrics.get("cpu_percent", 0.0),
+            "memory_mb": metrics.get("memory_mb", 0.0),
+            "avg_scan_time_ms": metrics.get("avg_scan_time_ms", 0.0),
+            "avg_runtime_cost_ms": metrics.get("avg_runtime_cost_ms", 0.0),
+            "requests_processed": metrics.get("requests_processed", 0),
+            "requests_blocked": metrics.get("requests_blocked", 0),
+            "requests_allowed": metrics.get("requests_allowed", 0),
         }
 
     def get_security_score(self) -> int:
-        # Recalculate score based on threats, warnings, etc.
-        self._update_security_score()
-        return self._security_score
+        """Compute security score from warnings and runtime health."""
+        # Recalculate to reflect latest state
+        return self._compute_security_score_from_warnings()
 
     def get_dashboard_data(self) -> Dict[str, Any]:
         """Aggregate all data for WebSocket push."""
+        # Update runtime status from metrics file
+        self.get_runtime_status()  # triggers refresh
         return {
             "projects": self.get_projects(),
             "runtime": self.get_runtime_status(),
@@ -303,97 +530,24 @@ class SimulationDataProvider:
         }
 
     def set_runtime_status(self, status: str) -> None:
+        """Update runtime status and persist to metrics file."""
         try:
-            self._runtime_config.status = RuntimeStatus(status)
+            new_status = RuntimeStatus(status)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid status")
 
-    # -------------------------------------------------------------------------
-    # Simulation internals
-    # -------------------------------------------------------------------------
-
-    def _simulate_requests(self) -> None:
-        # Simulate new requests
-        new_requests = random.randint(1, 10)
-        for _ in range(new_requests):
-            self._request_counter += 1
-            if random.random() < 0.15:
-                self._blocked_counter += 1
-
-    def _add_random_threat(self) -> None:
-        methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
-        paths = [
-            "/api/login", "/api/users", "/admin", "/api/payment",
-            "/api/upload", "/api/profile", "/api/orders", "/api/status"
-        ]
-        reasons = [
-            "Suspicious request pattern",
-            "Malformed input detected",
-            "SQL injection attempt",
-            "XSS attempt",
-            "Unusual user agent",
-            "Rate limit exceeded",
-            "Invalid authentication token",
-            "IP blacklisted",
-        ]
-        severity = random.choice(list(ThreatSeverity))
-        method = random.choice(methods)
-        path = random.choice(paths)
-        reason = random.choice(reasons)
-        status = random.choice([ThreatStatus.BLOCKED, ThreatStatus.ACTIVE])
-        decision = "block" if status == ThreatStatus.BLOCKED else "allow"
-        self._threat_id_counter += 1
-        threat = Threat(
-            id=f"threat-{self._threat_id_counter}",
-            timestamp=datetime.now(),
-            method=method,
-            path=path,
-            severity=severity,
-            status=status,
-            reason=reason,
-            decision=decision,
-            source_ip=f"192.168.{random.randint(1,255)}.{random.randint(1,255)}",
-        )
-        self._threats.append(threat)
-        if decision == "block":
-            self._blocked_counter += 1
-        if len(self._threats) > 100:
-            self._threats = self._threats[-100:]
-
-    def _update_performance(self) -> None:
-        # Simulate performance metrics
-        self._performance.cpu_percent = round(random.uniform(10, 75), 1)
-        self._performance.memory_mb = round(random.uniform(200, 1200), 1)
-        self._performance.avg_scan_time_ms = round(random.uniform(10, 80), 1)
-        self._performance.avg_runtime_cost_ms = round(random.uniform(5, 30), 1)
-        self._performance.requests_processed = self._request_counter
-        self._performance.requests_blocked = self._blocked_counter
-        self._performance.requests_allowed = self._request_counter - self._blocked_counter
-
-    def _update_security_score(self) -> None:
-        # Base score
-        score = 100
-        # Deduct for active threats
-        active_threats = [t for t in self._threats if t.status == ThreatStatus.ACTIVE]
-        if active_threats:
-            score -= len(active_threats) * 2
-        # Deduct for warnings
-        if self._warnings:
-            high_warnings = [w for w in self._warnings if w.severity in (ThreatSeverity.HIGH, ThreatSeverity.CRITICAL)]
-            score -= len(high_warnings) * 3
-            score -= (len(self._warnings) - len(high_warnings)) * 1
-        # Performance penalty
-        if self._performance.cpu_percent > 70:
-            score -= 5
-        if self._performance.memory_mb > 1000:
-            score -= 3
-        # Blocked requests ratio penalty
-        if self._request_counter > 0:
-            block_ratio = self._blocked_counter / self._request_counter
-            if block_ratio > 0.2:
-                score -= 10 * block_ratio
-        # Ensure between 0 and 100
-        self._security_score = max(0, min(100, int(score)))
+        # Update internal state
+        self._runtime_config.status = new_status
+        # Write to runtime_metrics.json
+        metrics = self._read_runtime_metrics()
+        metrics["runtime_status"] = status
+        if status == "running":
+            metrics["started_at"] = datetime.now().isoformat()
+        try:
+            with open(self._runtime_metrics_path, "w") as f:
+                json.dump(metrics, f, indent=2)
+        except Exception as e:
+            print(f"Failed to write runtime metrics: {e}")
 
 
 # ============================================================================
@@ -402,15 +556,15 @@ class SimulationDataProvider:
 
 app = FastAPI(title="Security Runtime Dashboard", version="1.0.0")
 
-# Data provider instance
-data_provider = SimulationDataProvider()
+# Global data provider - will be initialized after parsing args
+data_provider: Optional[RuntimeDataProvider] = None
 
 # Active WebSocket connections
 active_connections: Set[WebSocket] = set()
 
 
 # ----------------------------------------------------------------------------
-# HTML Dashboard
+# HTML Dashboard (unchanged)
 # ----------------------------------------------------------------------------
 
 DASHBOARD_HTML = """
@@ -1284,36 +1438,50 @@ async def root():
 
 @app.get("/api/projects")
 async def api_projects():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_projects()
 
 
 @app.get("/api/runtime")
 async def api_runtime():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_runtime_status()
 
 
 @app.get("/api/metrics")
 async def api_metrics():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_metrics()
 
 
 @app.get("/api/threats")
 async def api_threats():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_threats()
 
 
 @app.get("/api/warnings")
 async def api_warnings():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_warnings()
 
 
 @app.get("/api/performance")
 async def api_performance():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return data_provider.get_performance()
 
 
 @app.get("/api/security-score")
 async def api_security_score():
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     return {"score": data_provider.get_security_score()}
 
 
@@ -1324,6 +1492,8 @@ async def api_health():
 
 @app.post("/api/runtime/{action}")
 async def api_runtime_action(action: str):
+    if data_provider is None:
+        raise HTTPException(status_code=503, detail="Data provider not initialized")
     valid_actions = {"start", "pause", "stop", "restart", "reload"}
     if action not in valid_actions:
         raise HTTPException(status_code=400, detail="Invalid action")
@@ -1332,15 +1502,21 @@ async def api_runtime_action(action: str):
         "start": "running",
         "pause": "paused",
         "stop": "stopped",
-        "restart": "running",  # restart will reset
-        "reload": None,  # no status change
+        "restart": "running",
+        "reload": None,
     }
     if action == "restart":
-        # Simulate restart
-        data_provider._runtime_config.started_at = datetime.now()
-        data_provider._runtime_config.status = RuntimeStatus.RUNNING
+        data_provider.set_runtime_status("running")
+        # Also reset start time
+        metrics = data_provider._read_runtime_metrics()
+        metrics["started_at"] = datetime.now().isoformat()
+        try:
+            with open("runtime_metrics.json", "w") as f:
+                json.dump(metrics, f, indent=2)
+        except Exception:
+            pass
     elif action == "reload":
-        # Simulate reload
+        # Reload policies - just a placeholder
         pass
     else:
         new_status = status_map.get(action)
@@ -1359,20 +1535,22 @@ async def websocket_endpoint(websocket: WebSocket):
     active_connections.add(websocket)
     try:
         # Send initial data
+        if data_provider is None:
+            await websocket.send_json({"error": "Data provider not initialized"})
+            return
         initial = data_provider.get_dashboard_data()
         await websocket.send_json(initial)
 
         # Push updates every second
         while True:
-            # Check for client messages (e.g., runtime controls)
+            # Check for client messages (runtime controls)
             try:
                 msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
-                # Parse action
                 try:
                     data = json.loads(msg)
                     action = data.get("action")
                     if action in ("start", "pause", "stop", "restart", "reload"):
-                        # Handle via API logic (or directly)
+                        # Use the API handler logic
                         if action == "start":
                             data_provider.set_runtime_status("running")
                         elif action == "pause":
@@ -1380,8 +1558,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         elif action == "stop":
                             data_provider.set_runtime_status("stopped")
                         elif action == "restart":
-                            data_provider._runtime_config.started_at = datetime.now()
-                            data_provider._runtime_config.status = RuntimeStatus.RUNNING
+                            data_provider.set_runtime_status("running")
+                            metrics = data_provider._read_runtime_metrics()
+                            metrics["started_at"] = datetime.now().isoformat()
+                            try:
+                                with open("runtime_metrics.json", "w") as f:
+                                    json.dump(metrics, f, indent=2)
+                            except Exception:
+                                pass
                         elif action == "reload":
                             pass
                 except json.JSONDecodeError:
@@ -1390,8 +1574,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 pass
 
             # Send update
-            update = data_provider.get_dashboard_data()
-            await websocket.send_json(update)
+            if data_provider:
+                update = data_provider.get_dashboard_data()
+                await websocket.send_json(update)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         active_connections.remove(websocket)
@@ -1409,6 +1594,15 @@ def open_browser():
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Security Runtime Dashboard")
+    parser.add_argument("project_path", nargs="?", default=".", help="Project directory to analyze")
+    args = parser.parse_args()
+
+    global data_provider
+    data_provider = RuntimeDataProvider(project_path=args.project_path)
+
     print("=" * 60)
     print("  Security Runtime Dashboard")
     print("=" * 60)
