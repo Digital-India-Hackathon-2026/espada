@@ -1,28 +1,297 @@
 #!/usr/bin/env python3
 """
 Tech Scanner - Detect project tech stack
-Usage: python tech-scanner.py [path]
+Usage: python tech-scanner.py [path] [--json] [--verbose]
+
+Walks a directory tree, sniffing config files and source code to produce
+a structured report of the project's languages, frameworks, package manager,
+databases, deployment tooling, and build tools.
+
+Examples
+--------
+  python tech-scanner.py /path/to/project --json    # JSON output
+  python tech-scanner.py . --verbose                 # verbosely show skipped files
 """
 
+import argparse
+import json
 import os
-import sys
+import platform
 import re
+import subprocess
+import sys
 from pathlib import Path
 
-def scan_project(project_path: str) -> dict:
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_DIRS = frozenset(
+    {".git", "node_modules", "__pycache__", "venv", ".venv",
+     "target", "dist", "build", ".next", ".nuxt"}
+)
+
+_LANG_MAP = {
+    ".rs": "Rust", ".js": "JavaScript", ".mjs": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".py": "Python",
+    ".go": "Go", ".java": "Java", ".rb": "Ruby", ".php": "PHP",
+    ".cs": "C#", ".cpp": "C++", ".cc": "C++", ".cxx": "C++",
+    ".c": "C", ".h": "C",
+}
+
+# Framework detection: (dep_or_content_key, display_name)
+_NODE_FRAMEWORKS = [
+    ("react", "React"), ("vue", "Vue"), ("@angular/core", "Angular"),
+    ("next", "Next.js"), ("nuxt", "Nuxt"), ("svelte", "Svelte"),
+    ("express", "Express"), ("fastify", "Fastify"),
+]
+
+_RUST_FRAMEWORKS = [
+    ("actix-web", "Actix Web"), ("axum", "Axum"),
+    ("tokio", "Tokio"), ("rocket", "Rocket"),
+]
+
+_PYTHON_PACKAGE_FRAMEWORKS = [
+    ("django", "Django"), ("fastapi", "FastAPI"),
+    ("flask", "Flask"), ("quart", "Quart"),
+]
+
+_GO_FRAMEWORKS = [
+    ("gin-gonic/gin", "Gin"), ("labstack/echo", "Echo"),
+    ("gofiber/fiber", "Fiber"),
+]
+
+_JAVA_FRAMEWORKS = [("spring-boot", "Spring Boot")]
+
+_PHP_FRAMEWORKS = [("laravel", "Laravel"), ("symfony", "Symfony")]
+
+# Python app entry-point candidates — checked first to avoid scanning every file.
+_APP_ENTRY_POINTS = frozenset((
+    "app.py", "main.py", "create_app.py", "wsgi.py", "asgi.py",
+    "application.py", "__main__.py", "server.py", "run.py",
+    "web.py", "cli.py",
+))
+
+# Ordered priority list for primary-language tie-breaking.
+_LANG_PRIORITY = [
+    "Python", "TypeScript", "JavaScript", "Rust", "Go", "Java",
+    "Ruby", "PHP", "C#", "C++", "C",
+]
+
+
+# ---------------------------------------------------------------------------
+# Private helpers  (each handles one manifest / strategy)
+# ---------------------------------------------------------------------------
+
+def _scan_package_json(filepath: str, detected: dict, verbose: bool = False):
+    """Parse package.json for frameworks + detect npm."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    if not detected["package_manager"]:
+        detected["package_manager"] = "npm"
+
+    try:
+        pkg = json.loads(content)
+    except json.JSONDecodeError as exc:
+        if verbose:
+            _log_verbose(f"  [!] malformed JSON in {filepath}: {exc}")
+        return
+
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+
+    for dep, name in _NODE_FRAMEWORKS:
+        if dep in deps and name not in detected["frameworks"]:
+            detected["frameworks"].append(name)
+
+
+def _scan_cargo_toml(filepath: str, detected: dict, verbose: bool = False):
+    """Parse Cargo.toml for Rust framework detection."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Cargo"
+    languages["Rust"] = True
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    for key, name in _RUST_FRAMEWORKS:
+        if key in content and name not in detected["frameworks"]:
+            detected["frameworks"].append(name)
+
+
+def _scan_python_manifest(filepath: str, detected: dict, verbose: bool = False):
+    """Parse requirements.txt / Pipfile / pyproject.toml / setup.py."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "pip"
+    languages["Python"] = True
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    for key, name in _PYTHON_PACKAGE_FRAMEWORKS:
+        if key in content.lower() and name not in detected["frameworks"]:
+            detected["frameworks"].append(name)
+
+
+def _scan_go_mod(filepath: str, detected: dict, verbose: bool = False):
+    """Parse go.mod for Go frameworks."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Go Modules"
+    languages["Go"] = True
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    for key, name in _GO_FRAMEWORKS:
+        if key in content and name not in detected["frameworks"]:
+            detected["frameworks"].append(name)
+
+
+def _scan_java_manifest(filepath: str, detected: dict, verbose: bool = False):
+    """Parse pom.xml or build.gradle for Java frameworks."""
+    languages = detected.setdefault("_languages", {})
+    is_gradle = filepath.endswith(("build.gradle", "build.gradle.kts"))
+
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Maven" if filepath.endswith("pom.xml") else "Gradle"
+    languages["Java"] = True
+
+    if filepath.endswith("pom.xml"):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            if verbose:
+                _log_verbose(f"  [!] unreadable {filepath}")
+            return
+        for key, name in _JAVA_FRAMEWORKS:
+            if key in content and name not in detected["frameworks"]:
+                detected["frameworks"].append(name)
+
+
+def _scan_composer(filepath: str, detected: dict, verbose: bool = False):
+    """Parse composer.json for PHP frameworks."""
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Composer"
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    for key, name in _PHP_FRAMEWORKS:
+        if key in content.lower() and name not in detected["frameworks"]:
+            detected["frameworks"].append(name)
+
+
+def _scan_gemfile(filepath: str, detected: dict, verbose: bool = False):
+    """Parse Gemfile for Ruby on Rails."""
+    languages = detected.setdefault("_languages", {})
+    if not detected["package_manager"]:
+        detected["package_manager"] = "Bundler"
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        if verbose:
+            _log_verbose(f"  [!] unreadable {filepath}")
+        return
+
+    if "rails" in content.lower():
+        if "Ruby on Rails" not in detected["frameworks"]:
+            detected["frameworks"].append("Ruby on Rails")
+        languages["Ruby"] = True
+
+
+def _find_python_version(project_path: str, verbose: bool = False) -> str | None:
+    """Collect Python version from .python-version / pyproject.toml + runtime."""
+    # 1) Read .python-version if it exists (from the first walk).
+    for root, _dirs, files in os.walk(project_path):
+        if ".python-version" in files:
+            try:
+                with open(os.path.join(root, ".python-version"), "r") as f:
+                    val = f.read().strip()
+                if val:
+                    return val  # e.g. "3.11.4" or "3.12"
+            except Exception:
+                pass
+            break
+
+    # 2) Fallback: read pyproject.toml constraint (walk once to find it).
+    for root, _dirs, files in os.walk(project_path):
+        if "pyproject.toml" in files:
+            try:
+                with open(os.path.join(root, "pyproject.toml"), "r") as f:
+                    content = f.read()
+                match = re.search(r'python\s*=\s*"([^"]+)"', content)
+                if match:
+                    return match.group(1)  # may be "^3.9" or ">=3.8"
+            except Exception:
+                pass
+            break
+
+    # 3) Runtime fallback.
+    try:
+        result = subprocess.run(
+            ["python", "--version"], capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip().replace("Python ", "")
+    except Exception:
+        pass
+
+    return None
+
+
+def _log_verbose(msg: str) -> None:
+    """Print a message only when --verbose is enabled."""
+    print(f"  [v] {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def scan_project(project_path: str, *, verbose: bool = False) -> dict:
+    """Scan *project_path* and return a result dictionary.
+
+    Returns
+    -------
+    dict
+        ``{"project_path": ..., "apps_found": [...], "detected": {...}}``
+    """
     project_path = os.path.abspath(project_path)
-    frameworks = []
-    package_managers = []
-    build_tools = []
-    databases = []
-    languages = {}
-    apps_found = []
-    config_files = []
-    env_files = []
-    python_env = None
     detected = {
         "language": None,
         "frameworks": [],
+        "_languages": {},       # internal language tally (hidden from output)
         "package_manager": None,
         "build_tools": [],
         "databases": [],
@@ -31,298 +300,152 @@ def scan_project(project_path: str) -> dict:
         "python_env": None,
     }
 
-    # Walk directory
+    pyproject_paths: list[str] = []       # collect during walk (Fix #8)
+    app_py_files: list[tuple[str, str]] = []  # entry points found
+    other_py_files: list[tuple[str, str]] = []  # everything else
+
     for root, dirs, files in os.walk(project_path):
-        dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'target', 'dist', 'build', '.next', '.nuxt'}]
+        dirs[:] = [d for d in dirs if d not in _EXCLUDED_DIRS]
 
         for filename in files:
             filepath = os.path.join(root, filename)
             rel_path = os.path.relpath(filepath, project_path)
 
-            # package.json - Node.js
+            # -- manifest dispatchers -----------------------------------------
             if filename == "package.json":
+                _scan_package_json(filepath, detected, verbose)
+
+            elif filename == "Cargo.toml":
+                _scan_cargo_toml(filepath, detected, verbose)
+
+            elif filename in ("requirements.txt", "Pipfile", "pyproject.toml", "setup.py"):
+                _scan_python_manifest(filepath, detected, verbose)
+                if filename == "pyproject.toml":
+                    pyproject_paths.append(filepath)
+
+            elif filename == "go.mod":
+                _scan_go_mod(filepath, detected, verbose)
+
+            elif filename in ("pom.xml", "build.gradle", "build.gradle.kts"):
+                _scan_java_manifest(filepath, detected, verbose)
+
+            elif filename == "composer.json":
+                _scan_composer(filepath, detected, verbose)
+
+            elif filename == "Gemfile":
+                _scan_gemfile(filepath, detected, verbose)
+
+            # -- Python version (single pass; Fix #8: collected here) ---------
+            elif filename == ".python-version":
                 try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if not detected["package_manager"]:
-                            detected["package_manager"] = "npm"
-
-                        import json
-                        pkg = json.loads(content)
-                        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-
-                        for dep in deps:
-                            if dep == "react" and "React" not in detected["frameworks"]:
-                                detected["frameworks"].append("React")
-                            elif dep == "vue" and "Vue" not in detected["frameworks"]:
-                                detected["frameworks"].append("Vue")
-                            elif dep == "@angular/core" and "Angular" not in detected["frameworks"]:
-                                detected["frameworks"].append("Angular")
-                            elif dep == "next" and "Next.js" not in detected["frameworks"]:
-                                detected["frameworks"].append("Next.js")
-                            elif dep == "nuxt" and "Nuxt" not in detected["frameworks"]:
-                                detected["frameworks"].append("Nuxt")
-                            elif dep == "svelte" and "Svelte" not in detected["frameworks"]:
-                                detected["frameworks"].append("Svelte")
-                            elif dep == "express" and "Express" not in detected["frameworks"]:
-                                detected["frameworks"].append("Express")
-                            elif dep == "fastify" and "Fastify" not in detected["frameworks"]:
-                                detected["frameworks"].append("Fastify")
-                            elif dep in ("nest", "@nestjs/core") and "NestJS" not in detected["frameworks"]:
-                                detected["frameworks"].append("NestJS")
+                    with open(filepath, "r") as f:
+                        val = f.read().strip()
+                    if val and not detected["python_env"]:
+                        detected["python_env"] = val
                 except Exception:
                     pass
 
-            # Cargo.toml - Rust
-            if filename == "Cargo.toml":
+            # -- lock files ---------------------------------------------------
+            elif filename == "yarn.lock":
                 if not detected["package_manager"]:
-                    detected["package_manager"] = "Cargo"
-                languages["Rust"] = True
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "actix-web" in content and "Actix Web" not in detected["frameworks"]:
-                            detected["frameworks"].append("Actix Web")
-                        if "axum" in content and "Axum" not in detected["frameworks"]:
-                            detected["frameworks"].append("Axum")
-                        if "tokio" in content and "Tokio" not in detected["frameworks"]:
-                            detected["frameworks"].append("Tokio")
-                        if "rocket" in content and "Rocket" not in detected["frameworks"]:
-                            detected["frameworks"].append("Rocket")
-                except Exception:
-                    pass
-
-            # Python files
-            if filename in ("requirements.txt", "Pipfile", "pyproject.toml", "setup.py"):
+                    detected["package_manager"] = "Yarn"
+            elif filename == "pnpm-lock.yaml":
                 if not detected["package_manager"]:
-                    detected["package_manager"] = "pip"
-                languages["Python"] = True
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "django" in content.lower() and "Django" not in detected["frameworks"]:
-                            detected["frameworks"].append("Django")
-                        if "fastapi" in content.lower() and "FastAPI" not in detected["frameworks"]:
-                            detected["frameworks"].append("FastAPI")
-                        if "flask" in content.lower() and "Flask" not in detected["frameworks"]:
-                            detected["frameworks"].append("Flask")
-                        if "quart" in content.lower() and "Quart" not in detected["frameworks"]:
-                            detected["frameworks"].append("Quart")
-                except Exception:
-                    pass
-
-            # Python version file
-            if filename == ".python-version" and not python_env:
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        python_env = f.read().strip()
-                        detected["python_env"] = python_env
-                except Exception:
-                    pass
-
-            # go.mod - Go
-            if filename == "go.mod":
+                    detected["package_manager"] = "pnpm"
+            elif filename == "bun.lockb":
                 if not detected["package_manager"]:
-                    detected["package_manager"] = "Go Modules"
-                languages["Go"] = True
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "gin-gonic/gin" in content and "Gin" not in detected["frameworks"]:
-                            detected["frameworks"].append("Gin")
-                        if "labstack/echo" in content and "Echo" not in detected["frameworks"]:
-                            detected["frameworks"].append("Echo")
-                        if "gofiber/fiber" in content and "Fiber" not in detected["frameworks"]:
-                            detected["frameworks"].append("Fiber")
-                except Exception:
-                    pass
-
-            # Java/Maven/Gradle
-            if filename == "pom.xml":
+                    detected["package_manager"] = "Bun"
+            elif filename == "uv.lock":
                 if not detected["package_manager"]:
-                    detected["package_manager"] = "Maven"
-                languages["Java"] = True
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "spring-boot" in content and "Spring Boot" not in detected["frameworks"]:
-                            detected["frameworks"].append("Spring Boot")
-                except Exception:
-                    pass
-
-            if filename in ("build.gradle", "build.gradle.kts"):
+                    detected["package_manager"] = "uv"
+            elif filename == "poetry.lock":
                 if not detected["package_manager"]:
-                    detected["package_manager"] = "Gradle"
-                languages["Java"] = True
+                    detected["package_manager"] = "poetry"
 
-            # PHP
-            if filename == "composer.json":
-                if not detected["package_manager"]:
-                    detected["package_manager"] = "Composer"
+            # -- TypeScript ---------------------------------------------------
+            elif filename == "tsconfig.json":
+                detected["_languages"]["TypeScript"] = True
 
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "laravel" in content.lower() and "Laravel" not in detected["frameworks"]:
-                            detected["frameworks"].append("Laravel")
-                        if "symfony" in content.lower() and "Symfony" not in detected["frameworks"]:
-                            detected["frameworks"].append("Symfony")
-                except Exception:
-                    pass
-
-            # Ruby
-            if filename == "Gemfile":
-                if not detected["package_manager"]:
-                    detected["package_manager"] = "Bundler"
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "rails" in content.lower() and "Ruby on Rails" not in detected["frameworks"]:
-                            detected["frameworks"].append("Ruby on Rails")
-                            languages["Ruby"] = True
-                except Exception:
-                    pass
-
-            # Lock files
-            if filename == "yarn.lock" and not detected["package_manager"]:
-                detected["package_manager"] = "Yarn"
-            if filename == "pnpm-lock.yaml" and not detected["package_manager"]:
-                detected["package_manager"] = "pnpm"
-            if filename == "bun.lockb" and not detected["package_manager"]:
-                detected["package_manager"] = "Bun"
-            if filename == "uv.lock" and not detected["package_manager"]:
-                detected["package_manager"] = "uv"
-            if filename == "poetry.lock" and not detected["package_manager"]:
-                detected["package_manager"] = "poetry"
-
-            # TypeScript config
-            if filename == "tsconfig.json":
-                languages["TypeScript"] = True
-
-            # Build tools
-            if filename in ("vite.config.ts", "vite.config.js"):
+            # -- build tools --------------------------------------------------
+            elif filename in ("vite.config.ts", "vite.config.js"):
                 if "Vite" not in detected["build_tools"]:
                     detected["build_tools"].append("Vite")
-            if filename.startswith("webpack.config"):
+            elif filename.startswith("webpack.config"):
                 if "Webpack" not in detected["build_tools"]:
                     detected["build_tools"].append("Webpack")
-            if filename in ("next.config.js", "next.config.ts"):
+            elif filename in ("next.config.js", "next.config.ts"):
                 if "Next.js" not in detected["build_tools"]:
                     detected["build_tools"].append("Next.js")
 
-            # Docker
-            if filename in ("Dockerfile", "docker-compose.yml", "docker-compose.yaml"):
+            # -- Docker / deployment ------------------------------------------
+            elif filename in ("Dockerfile", "docker-compose.yml", "docker-compose.yaml"):
                 if "Docker" not in detected["deployment"]:
                     detected["deployment"].append("Docker")
 
-            # Config files
-            if filename in (".env", ".env.local", ".env.production", ".env.development"):
+            # -- config files -------------------------------------------------
+            elif filename in (".env", ".env.local", ".env.production", ".env.development"):
                 if ".env" not in detected["config"]:
                     detected["config"].append(".env")
-            if filename in ("security.yaml", "security.yml", "app.config", "settings.yaml"):
+            elif filename in ("security.yaml", "security.yml", "app.config", "settings.yaml"):
                 detected["config"].append(filename)
 
-            # Detect SQLite from file extension
-            if filename.endswith((".db", ".sqlite", ".sqlite3")):
+            # -- SQLite -------------------------------------------------------
+            elif filename.endswith((".db", ".sqlite", ".sqlite3")):
                 if "SQLite" not in detected["databases"]:
                     detected["databases"].append("SQLite")
 
-            # Database detection (from docker-compose and code)
-            if filename == "docker-compose.yml" or filename == "docker-compose.yaml":
+            # -- database detection from docker-compose -----------------------
+            elif filename in ("docker-compose.yml", "docker-compose.yaml"):
                 try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
+                    with open(filepath, "r", encoding="utf-8") as f:
                         content = f.read().lower()
-                        # Look for image: postgres, mysql, etc.
-                        if ("image: postgres" in content or "postgres:" in content) and "PostgreSQL" not in detected["databases"]:
-                            detected["databases"].append("PostgreSQL")
-                        if ("image: mysql" in content or "mysql:" in content) and "MySQL" not in detected["databases"]:
-                            detected["databases"].append("MySQL")
-                        if ("image: mongodb" in content or "mongo:" in content) and "MongoDB" not in detected["databases"]:
-                            detected["databases"].append("MongoDB")
-                        if ("image: redis" in content or "redis:" in content) and "Redis" not in detected["databases"]:
-                            detected["databases"].append("Redis")
-                        if ("image: mariadb" in content or "mariadb:" in content) and "MariaDB" not in detected["databases"]:
-                            detected["databases"].append("MariaDB")
+                    db_checks = [
+                        ("image: postgres", "PostgreSQL"), ("postgres:", "PostgreSQL"),
+                        ("image: mysql", "MySQL"), ("mysql:", "MySQL"),
+                        ("image: mongodb", "MongoDB"), ("mongo:", "MongoDB"),
+                        ("image: redis", "Redis"), ("redis:", "Redis"),
+                        ("image: mariadb", "MariaDB"), ("mariadb:", "MariaDB"),
+                    ]
+                    for pattern, name in db_checks:
+                        if pattern in content and name not in detected["databases"]:
+                            detected["databases"].append(name)
                 except Exception:
                     pass
 
-            # Detect databases from code imports
-            if filename.endswith(".py"):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        if "from sqlalchemy" in content or "import sqlalchemy" in content:
-                            if "PostgreSQL" not in detected["databases"]:
-                                detected["databases"].append("PostgreSQL")
-                        if "from pymongo" in content or "import pymongo" in content:
-                            if "MongoDB" not in detected["databases"]:
-                                detected["databases"].append("MongoDB")
-                        if "redis" in content.lower() and "import redis" in content.lower():
-                            if "Redis" not in detected["databases"]:
-                                detected["databases"].append("Redis")
-                except Exception:
-                    pass
+            # -- Python application entry points (Fix #7: separate lists) ----
+            elif filename.endswith(".py"):
+                detected["_languages"]["Python"] = True
+                if filename in _APP_ENTRY_POINTS:
+                    app_py_files.append((filepath, rel_path))
+                else:
+                    other_py_files.append((filepath, rel_path))
 
-            # Check for application entry points
-            if filename.endswith(".py") and filename not in ("__init__.py", "setup.py", "manage.py"):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        # Look for FastAPI/Flask/Django app objects
-                        if "from fastapi import" in content or "FastAPI()" in content:
-                            if not any(a["framework"] == "FastAPI" for a in apps_found):
-                                apps_found.append({"framework": "FastAPI", "file": rel_path, "object": "app"})
-                            detected["frameworks"].append("FastAPI")
-                        elif "from flask import" in content or "Flask(" in content:
-                            if not any(a["framework"] == "Flask" for a in apps_found):
-                                apps_found.append({"framework": "Flask", "file": rel_path, "object": "app"})
-                            detected["frameworks"].append("Flask")
-                        elif "from quart import" in content or "Quart(" in content:
-                            if not any(a["framework"] == "Quart" for a in apps_found):
-                                apps_found.append({"framework": "Quart", "file": rel_path, "object": "app"})
-                            detected["frameworks"].append("Quart")
-                        elif "from django import" in content or "django.setup()" in content:
-                            if "Django" not in detected["frameworks"]:
-                                detected["frameworks"].append("Django")
-                        elif "from tornado import" in content or "tornado.web" in content:
-                            if "Tornado" not in detected["frameworks"]:
-                                detected["frameworks"].append("Tornado")
-                except Exception:
-                    pass
-
-            # Language detection by extension
+            # -- language by extension (catch-all) ----------------------------
             ext = os.path.splitext(filename)[1].lower()
-            ext_map = {
-                ".rs": "Rust",
-                ".js": "JavaScript",
-                ".mjs": "JavaScript",
-                ".ts": "TypeScript",
-                ".tsx": "TypeScript",
-                ".py": "Python",
-                ".go": "Go",
-                ".java": "Java",
-                ".rb": "Ruby",
-                ".php": "PHP",
-                ".cs": "C#",
-                ".cpp": "C++",
-                ".cc": "C++",
-                ".cxx": "C++",
-                ".c": "C",
-                ".h": "C",
-            }
-            if ext in ext_map:
-                languages[ext_map[ext]] = True
+            if ext and ext in _LANG_MAP:
+                detected["_languages"][_LANG_MAP[ext]] = True
 
-    # Determine primary language (with framework-aware priority)
-    # If Python frameworks detected, prioritize Python over JS
+    # ------------------------------------------------------------------
+    # Post-walk processing
+    # ------------------------------------------------------------------
+
+    # --- Database detection from Python imports (Fix #7: entry points first) ---
+    for filepath, rel_path in app_py_files + other_py_files:
+        _scan_python_imports_db(filepath, detected, verbose)
+
+    # --- App object detection (entry points first, then others) ----------
+    for filepath, rel_path in app_py_files + other_py_files:
+        _scan_python_app_objects(filepath, rel_path, detected, verbose)
+
+    # --- Extract internal languages dict ---------------------------------
+    languages = {k: v for k, v in detected.pop("_languages").items()}
+    detected["frameworks"] = list(dict.fromkeys(detected["frameworks"]))  # dedup, preserve order
+
+    # --- Primary language (Fix #14: priority order) ----------------------
     if detected["frameworks"]:
         fw_names = [f.lower() for f in detected["frameworks"]]
-        if any(f in fw_names for f in ["fastapi", "django", "flask", "quart", " tornado"]):
+        python_frameworks = {"fastapi", "django", "flask", "quart", "tornado"}
+        if any(f in fw_names for f in python_frameworks):
             detected["language"] = "Python"
             languages["Python"] = True
         elif "TypeScript" in languages:
@@ -330,81 +453,139 @@ def scan_project(project_path: str) -> dict:
         elif "JavaScript" in languages:
             detected["language"] = "JavaScript"
     else:
-        if "TypeScript" in languages:
-            detected["language"] = "TypeScript"
-        elif "JavaScript" in languages:
-            detected["language"] = "JavaScript"
-        elif languages:
-            detected["language"] = list(languages.keys())[0]
+        for lang in _LANG_PRIORITY:
+            if lang in languages:
+                detected["language"] = lang
+                break
 
-    # Get Python version from runtime
+    # --- Python version (single walk; Fix #8) ----------------------------
     if not detected["python_env"] and detected["language"] == "Python":
-        import subprocess
-        try:
-            result = subprocess.run(["python", "--version"], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                ver = result.stdout.strip().replace("Python ", "")
-                detected["python_env"] = ver
-        except Exception:
-            pass
-        # Try to find version from pyproject.toml
-        for root, dirs, files in os.walk(project_path):
-            for f in files:
-                if f == "pyproject.toml":
-                    try:
-                        with open(os.path.join(root, f), 'r', encoding='utf-8') as file:
-                            content = file.read()
-                            match = re.search(r'python\s*=\s*"([^"]+)"', content)
-                            if match:
-                                detected["python_env"] = match.group(1)
-                    except Exception:
-                        pass
-
-    # Deduplicate frameworks
-    detected["frameworks"] = list(dict.fromkeys(detected["frameworks"]))
+        detected["python_env"] = _find_python_version(project_path, verbose)
 
     return {
         "project_path": project_path,
-        "apps_found": apps_found,
-        "detected": detected
+        "apps_found": [a for a in detected.pop("_apps", [])],  # clean up helper list
+        "detected": detected,
     }
 
-def print_output(result: dict):
+
+def _scan_python_imports_db(filepath: str, detected: dict, verbose: bool = False) -> None:
+    """Detect databases from Python source imports."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return
+
+    # SQLAlchemy => PostgreSQL (heuristic; not perfect but common)
+    if ("from sqlalchemy" in content or "import sqlalchemy" in content):
+        if "PostgreSQL" not in detected["databases"]:
+            detected["databases"].append("PostgreSQL")
+
+    if "from pymongo" in content or "import pymongo" in content:
+        if "MongoDB" not in detected["databases"]:
+            detected["databases"].append("MongoDB")
+
+    # Fix #6: use only one precise check (word boundary via regex).
+    if re.search(r'\bimport\s+redis\b', content):
+        if "Redis" not in detected["databases"]:
+            detected["databases"].append("Redis")
+
+
+def _scan_python_app_objects(filepath: str, rel_path: str, detected: dict, verbose: bool = False) -> None:
+    """Detect FastAPI/Flask/Django app objects in Python source files."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return
+
+    apps = detected.setdefault("_apps", [])
+
+    if "from fastapi import" in content or "FastAPI()" in content:
+        if not any(a["framework"] == "FastAPI" for a in apps):
+            apps.append({"framework": "FastAPI", "file": rel_path, "object": "app"})
+        if "FastAPI" not in detected["frameworks"]:
+            detected["frameworks"].append("FastAPI")
+
+    elif "from flask import" in content or "Flask(" in content:
+        if not any(a["framework"] == "Flask" for a in apps):
+            apps.append({"framework": "Flask", "file": rel_path, "object": "app"})
+        if "Flask" not in detected["frameworks"]:
+            detected["frameworks"].append("Flask")
+
+    elif "from quart import" in content or "Quart(" in content:
+        if not any(a["framework"] == "Quart" for a in apps):
+            apps.append({"framework": "Quart", "file": rel_path, "object": "app"})
+        if "Quart" not in detected["frameworks"]:
+            detected["frameworks"].append("Quart")
+
+    elif "from django" in content or "django.setup()" in content:
+        if "Django" not in detected["frameworks"]:
+            detected["frameworks"].append("Django")
+
+    elif "from tornado" in content or "tornado.web" in content:
+        if "Tornado" not in detected["frameworks"]:
+            detected["frameworks"].append("Tornado")
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_frameworks(fw_list: list[str]) -> str:
+    return "\n".join(f"  [*] {fw}" for fw in fw_list) or "  [-] None detected"
+
+
+def _fmt_databases(db_list: list[str]) -> str:
+    return "\n".join(f"  [*] {db}" for db in db_list) or "  [-] None detected"
+
+
+def _fmt_deployment(dep_list: list[str]) -> str:
+    return "\n".join(f"  [*] {dep}" for dep in dep_list) or "  [-] None detected"
+
+
+def _to_dict(result: dict) -> dict:
+    """Convert internal result to a clean serialisable dict (no helper keys)."""
+    d = {k: v for k, v in result["detected"].items()}
+    d.pop("_languages", None)
+    return {
+        "project_path": result["project_path"],
+        "apps_found": result.get("apps_found", []),
+        **d,
+    }
+
+
+def print_output(result: dict) -> None:
     detected = result["detected"]
     apps = result["apps_found"]
 
-    # Get Python version
-    import platform
     os_info = platform.platform()
     arch = platform.machine()
 
-    print("\n" + "=" * 62)
-    print("                    Project Intelligence")
-    print("=" * 62)
-    print("\n" + "[*] Scanning Project...")
+    header = "=" * 62
+    bar = "-" * 62
 
-    print("\n" + "-" * 62)
-    print(" Project Fingerprint")
-    print("-" * 62)
+    print("\n" + header)
+    print("                    Project Intelligence")
+    print(header)
+    print("\n[*] Scanning Project...")
 
     # Language
+    print("\n" + bar)
+    print(" Project Fingerprint")
+    print(bar)
+
     print("\nLanguage")
     if detected["language"]:
         ver = detected.get("python_env", "")
-        if ver:
-            print(f"  [*] {detected['language']} {ver}")
-        else:
-            print(f"  [*] {detected['language']}")
+        print(f"  [*] {detected['language']}{f' {ver}' if ver else ''}")
     else:
         print("  [-] None detected")
 
     # Frameworks
     print("\nFrameworks")
-    if detected["frameworks"]:
-        for fw in detected["frameworks"]:
-            print(f"  [*] {fw}")
-    else:
-        print("  [-] None detected")
+    print(_fmt_frameworks(detected["frameworks"]))
 
     # Applications Found
     print("\nApplications Found")
@@ -426,19 +607,11 @@ def print_output(result: dict):
 
     # Databases
     print("\nDatabase")
-    if detected["databases"]:
-        for db in detected["databases"]:
-            print(f"  [*] {db}")
-    else:
-        print("  [-] None detected")
+    print(_fmt_databases(detected["databases"]))
 
     # Deployment
     print("\nDeployment")
-    if detected["deployment"]:
-        for dep in detected["deployment"]:
-            print(f"  [*] {dep}")
-    else:
-        print("  [-] None detected")
+    print(_fmt_deployment(detected["deployment"]))
 
     # Environment
     print("\nEnvironment")
@@ -467,11 +640,55 @@ def print_output(result: dict):
         for bt in detected["build_tools"]:
             print(f"  [*] {bt}")
 
-    print("\n" + "-" * 62)
-    print(f" Total Files Scanned : {sum(1 for _, _, f in os.walk(result['project_path']) for _ in f)}")
-    print("-" * 62 + "\n")
+    # Confidence score (Fix #12)
+    signals = sum(bool(detected[c]) for c in
+                  ("language", "frameworks", "package_manager", "databases"))
+    confidence = min(signals * 25, 100)
+    print(f"\nConfidence : {confidence}% ({signals}/4 categories detected)")
+
+    print(bar)
+    total_files = sum(1 for _, _, f in os.walk(result["project_path"]) for _ in f)
+    print(f" Total Files Scanned : {total_files}")
+    print(bar + "\n")
+
+
+def print_json_output(result: dict) -> None:
+    """Pretty-print the result as JSON (Fix #9)."""
+    import json  # noqa: local reimport for clarity
+    print(json.dumps(_to_dict(result), indent=2))
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tech-scanner",
+        description="Detect a project's tech stack from its files.",
+    )
+    parser.add_argument(
+        "path", nargs="?", default=".",
+        help="Directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "--json", dest="as_json", action="store_true",
+        help="Output result as JSON instead of styled text",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Print diagnostic messages for skipped/unreadable files",
+    )
+    return parser
+
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else "."
-    result = scan_project(path)
-    print_output(result)
+    parser = build_parser()
+    args = parser.parse_args()
+
+    result = scan_project(args.path, verbose=args.verbose)
+
+    if args.as_json:
+        print_json_output(result)
+    else:
+        print_output(result)
