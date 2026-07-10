@@ -227,21 +227,44 @@ def scan_project(project_path: str) -> dict:
             if filename in ("security.yaml", "security.yml", "app.config", "settings.yaml"):
                 detected["config"].append(filename)
 
-            # Database detection
+            # Detect SQLite from file extension
+            if filename.endswith((".db", ".sqlite", ".sqlite3")):
+                if "SQLite" not in detected["databases"]:
+                    detected["databases"].append("SQLite")
+
+            # Database detection (from docker-compose and code)
             if filename == "docker-compose.yml" or filename == "docker-compose.yaml":
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
                         content = f.read().lower()
-                        if "postgres" in content and "PostgreSQL" not in detected["databases"]:
+                        # Look for image: postgres, mysql, etc.
+                        if ("image: postgres" in content or "postgres:" in content) and "PostgreSQL" not in detected["databases"]:
                             detected["databases"].append("PostgreSQL")
-                        if "mysql" in content and "MySQL" not in detected["databases"]:
+                        if ("image: mysql" in content or "mysql:" in content) and "MySQL" not in detected["databases"]:
                             detected["databases"].append("MySQL")
-                        if "mongodb" in content and "MongoDB" not in detected["databases"]:
+                        if ("image: mongodb" in content or "mongo:" in content) and "MongoDB" not in detected["databases"]:
                             detected["databases"].append("MongoDB")
-                        if "redis" in content and "Redis" not in detected["databases"]:
+                        if ("image: redis" in content or "redis:" in content) and "Redis" not in detected["databases"]:
                             detected["databases"].append("Redis")
-                        if "sqlite" in content and "SQLite" not in detected["databases"]:
-                            detected["databases"].append("SQLite")
+                        if ("image: mariadb" in content or "mariadb:" in content) and "MariaDB" not in detected["databases"]:
+                            detected["databases"].append("MariaDB")
+                except Exception:
+                    pass
+
+            # Detect databases from code imports
+            if filename.endswith(".py"):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        if "from sqlalchemy" in content or "import sqlalchemy" in content:
+                            if "PostgreSQL" not in detected["databases"]:
+                                detected["databases"].append("PostgreSQL")
+                        if "from pymongo" in content or "import pymongo" in content:
+                            if "MongoDB" not in detected["databases"]:
+                                detected["databases"].append("MongoDB")
+                        if "redis" in content.lower() and "import redis" in content.lower():
+                            if "Redis" not in detected["databases"]:
+                                detected["databases"].append("Redis")
                 except Exception:
                     pass
 
@@ -250,13 +273,25 @@ def scan_project(project_path: str) -> dict:
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
                         content = f.read()
-                        # Look for FastAPI/Flask app objects
+                        # Look for FastAPI/Flask/Django app objects
                         if "from fastapi import" in content or "FastAPI()" in content:
-                            apps_found.append({"framework": "FastAPI", "file": rel_path, "object": "app"})
+                            if not any(a["framework"] == "FastAPI" for a in apps_found):
+                                apps_found.append({"framework": "FastAPI", "file": rel_path, "object": "app"})
+                            detected["frameworks"].append("FastAPI")
                         elif "from flask import" in content or "Flask(" in content:
-                            apps_found.append({"framework": "Flask", "file": rel_path, "object": "app"})
-                        elif "app = Quart(" in content or "from quart import" in content:
-                            apps_found.append({"framework": "Quart", "file": rel_path, "object": "app"})
+                            if not any(a["framework"] == "Flask" for a in apps_found):
+                                apps_found.append({"framework": "Flask", "file": rel_path, "object": "app"})
+                            detected["frameworks"].append("Flask")
+                        elif "from quart import" in content or "Quart(" in content:
+                            if not any(a["framework"] == "Quart" for a in apps_found):
+                                apps_found.append({"framework": "Quart", "file": rel_path, "object": "app"})
+                            detected["frameworks"].append("Quart")
+                        elif "from django import" in content or "django.setup()" in content:
+                            if "Django" not in detected["frameworks"]:
+                                detected["frameworks"].append("Django")
+                        elif "from tornado import" in content or "tornado.web" in content:
+                            if "Tornado" not in detected["frameworks"]:
+                                detected["frameworks"].append("Tornado")
                 except Exception:
                     pass
 
@@ -283,16 +318,35 @@ def scan_project(project_path: str) -> dict:
             if ext in ext_map:
                 languages[ext_map[ext]] = True
 
-    # Determine primary language
-    if "TypeScript" in languages:
-        detected["language"] = "TypeScript"
-    elif "JavaScript" in languages:
-        detected["language"] = "JavaScript"
-    elif languages:
-        detected["language"] = list(languages.keys())[0]
+    # Determine primary language (with framework-aware priority)
+    # If Python frameworks detected, prioritize Python over JS
+    if detected["frameworks"]:
+        fw_names = [f.lower() for f in detected["frameworks"]]
+        if any(f in fw_names for f in ["fastapi", "django", "flask", "quart", " tornado"]):
+            detected["language"] = "Python"
+            languages["Python"] = True
+        elif "TypeScript" in languages:
+            detected["language"] = "TypeScript"
+        elif "JavaScript" in languages:
+            detected["language"] = "JavaScript"
+    else:
+        if "TypeScript" in languages:
+            detected["language"] = "TypeScript"
+        elif "JavaScript" in languages:
+            detected["language"] = "JavaScript"
+        elif languages:
+            detected["language"] = list(languages.keys())[0]
 
-    # Get Python version if still not detected
+    # Get Python version from runtime
     if not detected["python_env"] and detected["language"] == "Python":
+        import subprocess
+        try:
+            result = subprocess.run(["python", "--version"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                ver = result.stdout.strip().replace("Python ", "")
+                detected["python_env"] = ver
+        except Exception:
+            pass
         # Try to find version from pyproject.toml
         for root, dirs, files in os.walk(project_path):
             for f in files:
@@ -305,6 +359,9 @@ def scan_project(project_path: str) -> dict:
                                 detected["python_env"] = match.group(1)
                     except Exception:
                         pass
+
+    # Deduplicate frameworks
+    detected["frameworks"] = list(dict.fromkeys(detected["frameworks"]))
 
     return {
         "project_path": project_path,
