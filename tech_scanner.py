@@ -50,14 +50,13 @@ _NODE_FRAMEWORKS = [
 
 # Database detection for Node.js package names (covers pg, mongoose, etc.)
 _NODE_DB_PACKAGES = {
-    "pg": "PostgreSQL", "postgres": "PostgreSQL", "pg-hstore": "PostgreSQL",
+    "pg": "PostgreSQL", "pg-hstore": "PostgreSQL",
     "mysql2": "MySQL", "mysql": "MySQL", "sequelize": "PostgreSQL",
     "typeorm": "PostgreSQL", "prisma": "PostgreSQL",
     "mongoose": "MongoDB", "mongodb": "MongoDB", "@mongodb-js/mongodb": "MongoDB",
     "redis": "Redis", "ioredis": "Redis", "redis-om": "Redis",
     "fakeredis": "Redis", "hiredis": "Redis",
-    "mariadb": "MariaDB", "mysql2": "MySQL",
-    "pg": "PostgreSQL", "node-postgres": "PostgreSQL",
+    "mariadb": "MariaDB", "node-postgres": "PostgreSQL",
 }
 
 _RUST_FRAMEWORKS = [
@@ -65,9 +64,10 @@ _RUST_FRAMEWORKS = [
     ("tokio", "Tokio"), ("rocket", "Rocket"),
 ]
 
-# Database detection for Rust crates
+# Database detection for Rust crates (exact key match via _extract_rust_version)
 _RUST_DB_CRATES = {
-    "tokio-postgres": "PostgreSQL", "postgres": "PostgreSQL", "sqlx": "PostgreSQL",
+    "tokio-postgres": "PostgreSQL", "sqlx": "PostgreSQL",
+    "postgres": "PostgreSQL",  # exact [dependencies.postgres] only
     "mongodb": "MongoDB", "bson": "MongoDB",
     "redis": "Redis", "redis-async": "Redis",
     "diesel": "PostgreSQL", "sea-orm": "PostgreSQL",
@@ -143,40 +143,36 @@ def _extract_python_version(dep_line: str) -> str:
     """Extract version from a pip-style specifier like 'django==5.0.4' or 'flask>=2.0'.
 
     Returns the first matched version number (e.g. '5.0.4').
+    *wildcard is preserved as-is for accurate output.
     """
     m = re.search(r'[><=~!]+\s*([0-9][0-9a-zA-Z.*]*)', dep_line)
-    return m.group(1).rstrip('.').rstrip('*') if m else ""
+    return m.group(1).rstrip('.') if m else ""  # keep *, strip only trailing dots
 
 
 def _extract_rust_version(toml_content: str, crate_name: str) -> str | None:
-    """Simple TOML parser for a single dependency's version field."""
-    # Match [dependencies.package] or package = { version = "x.y.z" }
-    pattern = rf'^{re.escape(crate_name)}\s*=\s*(?:"([^"]+)"|\{{.*?\bversion\s*=\s*"([^"]+)"}})'
-    m = re.search(pattern, toml_content, re.MULTILINE | re.DOTALL)
-    if m:
-        version = m.group(1) or m.group(2)
-        # Strip ^ ~ >= operators
-        return re.sub(r'^[~^>=<]+', '', version or '')
+    """Simple TOML parser for a single dependency's version field.
+
+    Handles both simple syntax ``bson = "0.7"`` and inline table
+    syntax ``tokio-postgres = { version = "0.7", features = [...] }``.
+    """
+    lines = toml_content.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        # Match: crate_name = "x.y.z" or crate_name = { version = "x.y.z" }
+        if stripped.startswith(f'{crate_name} = '):
+            after = stripped[len(crate_name) + 3:]  # skip '= '
+            if after.startswith('"'):
+                # Direct string: "0.7"
+                end_quote = after.index('"', 1) if '"' in after[1:] else len(after)
+                ver = after[1:end_quote] if end_quote > 1 else ""
+                return re.sub(r'^[~^>=<]+', '', ver)
+            elif after.startswith('{'):
+                # Inline table: { version = "0.7", ... }
+                m = re.search(r'version\s*=\s*"([^"]+)"', after)
+                if m:
+                    return re.sub(r'^[~^>=<]+', '', m.group(1))
+
     return None
-
-
-def _extract_go_version(content: str, module: str) -> str | None:
-    """Extract version from go.mod require block."""
-    pattern = rf'(?:^|\n)\s*{re.escape(module)}\s+v([0-9][^\s]+)'
-    m = re.search(pattern, content)
-    return m.group(1) if m else None
-
-
-def _extract_java_version(content: str, artifact: str) -> str | None:
-    """Extract version from pom.xml <version> tag near a given artifact."""
-    # Simple approach: find <artifactId>...<version>... block
-    pattern = rf'<artifactId>\s*{re.escape(artifact)}\s*</artifactId>'
-    m = re.search(pattern, content)
-    if not m:
-        return None
-    snippet = content[m.end():m.end() + 200]
-    vm = re.search(r'<version>\s*([0-9][^\s<]*)', snippet)
-    return vm.group(1) if vm else None
 
 
 # ---------------------------------------------------------------------------
@@ -238,11 +234,13 @@ def _scan_cargo_toml(filepath: str, detected: dict, verbose: bool = False):
         if key in content and name not in detected["frameworks"]:
             detected["frameworks"].append(name)
 
-    # Detect databases from Rust crates
+    # Detect databases from Rust crates — exact [dependencies.xxx] key only.
+    deps_keys = set(re.findall(r'^\s*(\S+)\s*=', content, re.MULTILINE))
     for crate, db_name in _RUST_DB_CRATES.items():
-        version = _extract_rust_version(content, crate)
-        if (crate in content or f'{crate} = ' in content) and db_name not in detected["databases"]:
-            detected["databases"].append(db_name)
+        if crate in deps_keys and db_name not in detected["databases"]:
+            version = _extract_rust_version(content, crate)
+            if version:
+                detected["databases"].append(db_name)
 
 
 def _scan_python_manifest(filepath: str, detected: dict, verbose: bool = False):
@@ -272,10 +270,11 @@ def _scan_python_manifest(filepath: str, detected: dict, verbose: bool = False):
         if not line or line.startswith("#"):
             continue
         # Strip extras like [security], markers like ; python_version >= "3.8"
-        pkg_part = re.split(r'[>!=<;\[]', line)[0].strip()
+        pkg_part = re.split(r'[>!=<;\[]', line)[0].strip().lower()
         version_str = _extract_python_version(line)
         for pkg_name, db_name in _PYTHON_DB_PACKAGES.items():
-            if pkg_name.lower() in pkg_part.lower():
+            # Exact match only — package names with separators are safe (e.g. mysql-connector-python)
+            if pkg_part == pkg_name or pkg_part.startswith(f"{pkg_name}==") or pkg_part.startswith(f"{pkg_name}>="):
                 if db_name not in detected["databases"]:
                     detected["databases"].append(db_name)
 
@@ -303,7 +302,6 @@ def _scan_go_mod(filepath: str, detected: dict, verbose: bool = False):
 def _scan_java_manifest(filepath: str, detected: dict, verbose: bool = False):
     """Parse pom.xml or build.gradle for Java frameworks."""
     languages = detected.setdefault("_languages", {})
-    is_gradle = filepath.endswith(("build.gradle", "build.gradle.kts"))
 
     if not detected["package_manager"]:
         detected["package_manager"] = "Maven" if filepath.endswith("pom.xml") else "Gradle"
@@ -342,7 +340,13 @@ def _scan_composer(filepath: str, detected: dict, verbose: bool = False):
             _log_verbose(f"  [!] unreadable {filepath}")
             return
 
-    pkg = json.loads(content)
+    try:
+        pkg = json.loads(content)
+    except json.JSONDecodeError as exc:
+        if verbose:
+            _log_verbose(f"  [!] malformed JSON in {filepath}: {exc}")
+        return
+
     deps = {**pkg.get("require", {}), **pkg.get("require-dev", {})}
 
     for key, name in _PHP_FRAMEWORKS:
@@ -418,7 +422,12 @@ def _scan_dart_pubspec(filepath: str, detected: dict, verbose: bool = False):
         if stripped.startswith("dependencies:") or stripped == "dependencies:":
             deps_section = True
             continue
-        if deps_section and (stripped.startswith("dev_dependencies:") or stripped.startswith("flutter:") or not line[0].isspace()):
+        # Skip blank lines; exit deps section on non-indented or new top-level key
+        if not line:
+            continue
+        if deps_section and (stripped.startswith("dev_dependencies:")
+                or stripped.startswith("flutter:")
+                or not line[0].isspace()):
             deps_section = False
 
         if deps_section and ":" in stripped and not stripped.startswith("#"):
@@ -478,7 +487,8 @@ def _scan_kotlin_gradle(filepath: str, detected: dict, verbose: bool = False):
 
 def _find_python_version(project_path: str, verbose: bool = False) -> str | None:
     """Collect Python version from .python-version / pyproject.toml + runtime."""
-    # 1) Read .python-version if it exists (from the first walk).
+    # Single walk — find both .python-version and pyproject.toml at once.
+    pyproject_content = None
     for root, _dirs, files in os.walk(project_path):
         if ".python-version" in files:
             try:
@@ -488,22 +498,20 @@ def _find_python_version(project_path: str, verbose: bool = False) -> str | None
                     return val  # e.g. "3.11.4" or "3.12"
             except Exception:
                 pass
-            break
-
-    # 2) Fallback: read pyproject.toml constraint (walk once to find it).
-    for root, _dirs, files in os.walk(project_path):
-        if "pyproject.toml" in files:
+        if pyproject_content is None and "pyproject.toml" in files:
             try:
                 with open(os.path.join(root, "pyproject.toml"), "r") as f:
-                    content = f.read()
-                match = re.search(r'python\s*=\s*"([^"]+)"', content)
-                if match:
-                    return match.group(1)  # may be "^3.9" or ">=3.8"
+                    pyproject_content = f.read()
             except Exception:
                 pass
-            break
 
-    # 3) Runtime fallback.
+    # Read pyproject.toml constraint if .python-version not found.
+    if pyproject_content is not None:
+        match = re.search(r'python\s*=\s*"([^"]+)"', pyproject_content)
+        if match:
+            return match.group(1)  # may be "^3.9" or ">=3.8"
+
+    # Runtime fallback.
     try:
         result = subprocess.run(
             ["python", "--version"], capture_output=True, text=True, timeout=5,
@@ -533,7 +541,6 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
     dict
         ``{"project_path": ..., "apps_found": [...], "detected": {...}}``
     """
-    project_path = os.path.abspath(project_path)
     detected = {
         "language": None,
         "frameworks": [],
@@ -546,7 +553,6 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
         "python_env": None,
     }
 
-    pyproject_paths: list[str] = []       # collect during walk (Fix #8)
     app_py_files: list[tuple[str, str]] = []  # entry points found
     other_py_files: list[tuple[str, str]] = []  # everything else
     kotlin_gradle_files: list[tuple[str, str]] = []     # for Kotlin frameworks
@@ -558,7 +564,7 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
             filepath = os.path.join(root, filename)
             rel_path = os.path.relpath(filepath, project_path)
 
-            # -- manifest dispatchers -----------------------------------------
+                    # -- manifest dispatchers -----------------------------------------
             if filename == "package.json":
                 _scan_package_json(filepath, detected, verbose)
 
@@ -567,8 +573,6 @@ def scan_project(project_path: str, *, verbose: bool = False) -> dict:
 
             elif filename in ("requirements.txt", "Pipfile", "pyproject.toml", "setup.py"):
                 _scan_python_manifest(filepath, detected, verbose)
-                if filename == "pyproject.toml":
-                    pyproject_paths.append(filepath)
 
             elif filename == "go.mod":
                 _scan_go_mod(filepath, detected, verbose)
